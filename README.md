@@ -15,9 +15,11 @@ Mobile SDK.
 ## Install
 
 ```bash
-dotnet add package TouchQue.AspNetCore   # ASP.NET Core (brings TouchQue)
-dotnet add package TouchQue              # anything else: workers, consoles, Azure Functions
+dotnet add package Touchque.AspNetCore   # ASP.NET Core (brings Touchque)
+dotnet add package Touchque              # anything else: workers, consoles, Azure Functions
 ```
+
+The packages are `Touchque` and `Touchque.AspNetCore`; the namespaces stay `TouchQue` and `TouchQue.AspNetCore` (`using TouchQue;`).
 
 ## Setup
 

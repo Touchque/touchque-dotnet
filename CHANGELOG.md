@@ -7,6 +7,9 @@ format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [4.2.0] — 2026-11-10
 
+### Changed
+- **NuGet package IDs are `Touchque` and `Touchque.AspNetCore`**, the brand's spelling. The namespaces and assembly names stay `TouchQue` and `TouchQue.AspNetCore`, so code does not change (NuGet IDs are case-insensitive).
+
 ### Security
 - **The offline approval-token check refuses another workspace's token.** `GET /agents/jwks.json` is one key set for every Touchque workspace, and the check used to compare `aud` only when you passed an audience, so a token Touchque signed for someone else's workspace (their own phone, any person's name, any details) could pass your executor. Now:
   - `Agents.VerifyApprovalTokenAsync(token, audience = null, expect)` uses this workspace's own audience by default: `Agents.ApprovalAudienceAsync()` asks `GET /agents/approval-audience` once (`touchque:workspace:<id>`) and keeps it.

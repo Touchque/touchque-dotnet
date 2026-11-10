@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <PackageId>TouchQue</PackageId>
+    <PackageId>Touchque</PackageId>
     <AssemblyName>TouchQue</AssemblyName>
     <RootNamespace>TouchQue</RootNamespace>
     <Description>Official .NET SDK for Touchque Authenticator: push approvals with number matching, passkeys, silent sign-ins, webhooks, Touchque Actions, AI agents, Touchque Login (hosted sign-in and the Management API) and the Mobile SDK server side.</Description>

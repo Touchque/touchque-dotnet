@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <PackageId>TouchQue.AspNetCore</PackageId>
+    <PackageId>Touchque.AspNetCore</PackageId>
     <AssemblyName>TouchQue.AspNetCore</AssemblyName>
     <RootNamespace>TouchQue.AspNetCore</RootNamespace>
     <Description>ASP.NET Core integration for Touchque: AddTouchQue() registration, RequireTouchQue() on endpoints and controllers, the relay endpoints @touchque/web needs, verified webhooks, Touchque Login sign-in endpoints and a bearer handler for access tokens.</Description>
