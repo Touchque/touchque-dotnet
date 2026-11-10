@@ -6,9 +6,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <Version>4.2.0</Version>
-    <Authors>TouchQue</Authors>
-    <Company>TouchQue</Company>
-    <Copyright>Copyright (c) 2026 TouchQue</Copyright>
+    <Authors>Touchque</Authors>
+    <Company>Touchque</Company>
+    <Copyright>Copyright (c) 2026 Touchque</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://touchque.com</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Touchque/touchque-dotnet</RepositoryUrl>

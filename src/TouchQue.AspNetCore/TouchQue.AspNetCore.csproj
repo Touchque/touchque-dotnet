@@ -4,7 +4,7 @@
     <PackageId>TouchQue.AspNetCore</PackageId>
     <AssemblyName>TouchQue.AspNetCore</AssemblyName>
     <RootNamespace>TouchQue.AspNetCore</RootNamespace>
-    <Description>ASP.NET Core integration for TouchQue: AddTouchQue() registration, RequireTouchQue() on endpoints and controllers, the relay endpoints @touchque/web needs, verified webhooks, TouchQue Login sign-in endpoints and a bearer handler for access tokens.</Description>
+    <Description>ASP.NET Core integration for Touchque: AddTouchQue() registration, RequireTouchQue() on endpoints and controllers, the relay endpoints @touchque/web needs, verified webhooks, Touchque Login sign-in endpoints and a bearer handler for access tokens.</Description>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
   </PropertyGroup>

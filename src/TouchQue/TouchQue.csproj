@@ -4,7 +4,7 @@
     <PackageId>TouchQue</PackageId>
     <AssemblyName>TouchQue</AssemblyName>
     <RootNamespace>TouchQue</RootNamespace>
-    <Description>Official .NET SDK for TouchQue Authenticator: push approvals with number matching, passkeys, silent sign-ins, webhooks, TouchQue Actions, AI agents, TouchQue Login (hosted sign-in and the Management API) and the Mobile SDK server side.</Description>
+    <Description>Official .NET SDK for Touchque Authenticator: push approvals with number matching, passkeys, silent sign-ins, webhooks, Touchque Actions, AI agents, Touchque Login (hosted sign-in and the Management API) and the Mobile SDK server side.</Description>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
   </PropertyGroup>
