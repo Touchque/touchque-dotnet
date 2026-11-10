@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Environment
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Build artifacts
+dist/
+build/
+*.pyc
+__pycache__/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Go
+*.exe
+*.test
+*.out
+
+# PHP
+composer.lock
+
+# .NET
+bin/
+obj/
+TestResults/
+artifacts/
+*.nupkg
+*.snupkg
+*.user
+.vs/
+
+# Coverage
+coverage/
+.nyc_output/
+htmlcov/
