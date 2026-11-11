@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Touchque</PackageId>
+    <AssemblyName>Touchque</AssemblyName>
+    <RootNamespace>Touchque</RootNamespace>
+    <Description>Official .NET SDK for Touchque Authenticator: push approvals with number matching, passkeys, silent sign-ins, webhooks, Touchque Actions, AI agents, Touchque Login (hosted sign-in and the Management API) and the Mobile SDK server side.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Ed25519 (EdDSA agent keys and DPoP proofs): .NET has no built-in Ed25519. -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+    <!-- TouchqueOptions.Logger: the SDK logs nothing unless you pass one. -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <None Include="../../CHANGELOG.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Touchque.AspNetCore" />
+    <InternalsVisibleTo Include="Touchque.Tests" />
+  </ItemGroup>
+
+</Project>

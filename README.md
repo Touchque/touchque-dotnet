@@ -1,14 +1,14 @@
-# TouchQue for .NET
+# Touchque for .NET
 
-The official .NET server SDK for [TouchQue](https://touchque.com): push approvals with number
-matching, passkeys, silent sign-ins, offline codes, verified webhooks, TouchQue Actions, AI agent
-approvals, TouchQue Login (hosted sign-in and the Management API) and the server side of the
+The official .NET server SDK for [Touchque](https://touchque.com): push approvals with number
+matching, passkeys, silent sign-ins, offline codes, verified webhooks, Touchque Actions, AI agent
+approvals, Touchque Login (hosted sign-in and the Management API) and the server side of the
 Mobile SDK.
 
 | Package | What it is |
 | --- | --- |
-| `TouchQue` | The client. .NET 8+, async throughout, nullable annotations, `HttpClient` / `IHttpClientFactory` friendly. |
-| `TouchQue.AspNetCore` | `AddTouchQue()`, `RequireTouchQue()` on endpoints and `[RequireTouchQue]` on controllers, the relay endpoints `@touchque/web` needs, verified webhooks, TouchQue Login sign-in endpoints and a bearer handler. |
+| `Touchque` | The client. .NET 8+, async throughout, nullable annotations, `HttpClient` / `IHttpClientFactory` friendly. |
+| `Touchque.AspNetCore` | `AddTouchque()`, `RequireTouchque()` on endpoints and `[RequireTouchque]` on controllers, the relay endpoints `@touchque/web` needs, verified webhooks, Touchque Login sign-in endpoints and a bearer handler. |
 
 📘 Full docs: **[support.touchque.com](https://support.touchque.com)**
 
@@ -19,11 +19,14 @@ dotnet add package Touchque.AspNetCore   # ASP.NET Core (brings Touchque)
 dotnet add package Touchque              # anything else: workers, consoles, Azure Functions
 ```
 
-The packages are `Touchque` and `Touchque.AspNetCore`; the namespaces stay `TouchQue` and `TouchQue.AspNetCore` (`using TouchQue;`).
+> **Not on NuGet yet.** Until it is, add the projects `src/Touchque` and `src/Touchque.AspNetCore` from
+> [this repository](https://github.com/Touchque/touchque-dotnet) to your solution.
+
+The packages, assemblies and namespaces are `Touchque` and `Touchque.AspNetCore` (`using Touchque;`, `using Touchque.AspNetCore;`). Coming from 4.x, where the namespaces were spelled with a capital Q: see the 5.0.0 entry in the [CHANGELOG](CHANGELOG.md).
 
 ## Setup
 
-Get an API key and secret from your [TouchQue dashboard](https://dashboard.touchque.com):
+Get an API key and secret from your [Touchque dashboard](https://dashboard.touchque.com):
 
 ```bash
 export TQ_API_KEY=tq_auth_your_key
@@ -33,18 +36,18 @@ export TQ_API_SECRET=your_api_secret
 The secret signs every request: it belongs on your server only, never in a browser or an app.
 
 ```csharp
-builder.Services.AddTouchQue();                       // from the environment
-builder.Services.AddTouchQue(o => o.ApiKey = "…");    // or from your own configuration
+builder.Services.AddTouchque();                       // from the environment
+builder.Services.AddTouchque(o => o.ApiKey = "…");    // or from your own configuration
 ```
 
 Outside ASP.NET Core:
 
 ```csharp
-var tq = new TouchQueClient();                                            // TQ_API_KEY / TQ_API_SECRET
-var tq = new TouchQueClient(new TouchQueOptions { ApiKey = "…", ApiSecret = "…" });
+var tq = new TouchqueClient();                                            // TQ_API_KEY / TQ_API_SECRET
+var tq = new TouchqueClient(new TouchqueOptions { ApiKey = "…", ApiSecret = "…" });
 ```
 
-`TouchQueClient` is thread-safe: create one and reuse it.
+`TouchqueClient` is thread-safe: create one and reuse it.
 
 ## Quick start (ASP.NET Core)
 
@@ -53,11 +56,11 @@ One line per protected endpoint:
 ```csharp
 app.MapPost("/transfer", (Transfer t, HttpContext http) =>
     {
-        var approval = http.GetTouchQueApproval()!;   // only reached once the user approved
+        var approval = http.GetTouchqueApproval()!;   // only reached once the user approved
         return Results.Ok();
     })
     .RequireAuthorization()
-    .RequireTouchQue("SEND_MONEY", o => o.Details = c =>
+    .RequireTouchque("SEND_MONEY", o => o.Details = c =>
         [("Amount", c.Argument<Transfer>()!.Amount), ("To", c.Argument<Transfer>()!.To)]);
 ```
 
@@ -65,16 +68,16 @@ Controllers:
 
 ```csharp
 [HttpPost("/payouts")]
-[RequireTouchQue("PAYOUT")]
-public IActionResult Create() => Ok(HttpContext.GetTouchQueApproval());
+[RequireTouchque("PAYOUT")]
+public IActionResult Create() => Ok(HttpContext.GetTouchqueApproval());
 // details, a login user or silent sign-ins for it:
-builder.Services.Configure<TouchQueGuardOptions>("PAYOUT", o => o.Details = c => …);
+builder.Services.Configure<TouchqueGuardOptions>("PAYOUT", o => o.Details = c => …);
 ```
 
 Until the user approves on their phone the endpoint answers
 **`202 {"touchque": step, "token": "..."}`**. Your page shows `step` in its own design (the
 matching number, or a QR code the first time the user links the app) and sends the same request
-again with header `X-TouchQue-Token: <token>`; [`@touchque/web`](https://www.npmjs.com/package/@touchque/web)
+again with header `X-Touchque-Token: <token>`; [`@touchque/web`](https://www.npmjs.com/package/@touchque/web)
 does this loop for you. Once approved the endpoint runs **once**. Refusals answer 403 (rejected,
 blocked), 408 (expired), 423 (frozen) or 429 (rate limited) with `Retry-After`.
 
@@ -85,6 +88,21 @@ password check.
 **The end user's address.** The risk checks (Tor, location, impossible travel) and the location
 shown on the phone use `HttpContext.Connection.RemoteIpAddress`. Behind a load balancer add
 `app.UseForwardedHeaders()` with your proxy as a known proxy, so it is the address your proxy saw.
+
+## Action types
+
+`"SEND_MONEY"` above is an action type: one kind of approval, with the title the phone shows and
+whether it is critical. Define each one once, in the dashboard (**Developers → Action types**)
+or from code:
+
+```csharp
+await tq.ActionTypes.DefineAsync("SEND_MONEY", name: "Send money", critical: true);
+```
+
+The guard refuses what is not ready. A name that is not defined is a setup error
+(`TouchqueConfigException`, "Unknown action …"): the guard answers 500 with `reason: "misconfigured"`. A type
+turned off in the dashboard answers 403 with `reason: "action_disabled"`, which stops that kind of
+approval at once, without a deploy.
 
 ## The three primitives (any framework)
 
@@ -113,16 +131,16 @@ var result = await tq.Login.VerifyAsync(new LoginRequestOptions
 });
 ```
 
-`VerifyAsync` throws `TouchQueRejectedException`, `TouchQueTimeoutException` or
-`TouchQuePasskeyRequiredException` (`Reason` `policy`: approve with a passkey; `step_up`: the user
+`VerifyAsync` throws `TouchqueRejectedException`, `TouchqueTimeoutException` or
+`TouchquePasskeyRequiredException` (`Reason` `policy`: approve with a passkey; `step_up`: the user
 tapped Approve during a call and the request now waits for a passkey).
 
 ## Relay endpoints for `@touchque/web`
 
 ```csharp
-app.MapTouchQueRelay("/touchque", new RelayOptions<HttpContext>
+app.MapTouchqueRelay("/touchque", new RelayOptions<HttpContext>
 {
-    GetUserId = http => http.User.TouchQueUser(),
+    GetUserId = http => http.User.TouchqueUser(),
     // The user who already passed your password step. Binds /login and the offline routes to them.
     GetLoginUser = http => http.Session.GetString("password_verified_user"),
     OnAuthenticated = async (http, response, info) => await SignInAsync(http, info.ExternalUsername),
@@ -140,7 +158,7 @@ passkey for a user with a linked phone waits for the phone first.
 ## Webhooks
 
 ```csharp
-app.MapTouchQueWebhook("/webhooks/touchque", async (JsonObject e, HttpContext http) =>
+app.MapTouchqueWebhook("/webhooks/touchque", async (JsonObject e, HttpContext http) =>
 {
     if ((string?)e["event"] == WebhookResource.EventApprovalRevoked) await EndSessionAsync((string)e["requestId"]!);
 });
@@ -148,13 +166,13 @@ app.MapTouchQueWebhook("/webhooks/touchque", async (JsonObject e, HttpContext ht
 
 The signature (your API secret over the canonical JSON), the signed timestamp (5 minutes) and the
 `jti` (replays answered 200 without calling you again) are checked first. The in-process replay
-cache is registered by `AddTouchQue()`; with several instances register your own
+cache is registered by `AddTouchque()`; with several instances register your own
 `IWebhookReplayCache` (Redis `SET NX EX`). Anywhere else: `tq.Webhook.VerifyAsync(rawBody, signatureHeader, 300, cache)`.
 
 ## Silent sign-ins
 
 ```csharp
-var risk = await tq.Risk.CheckAsync(new RiskCheckOptions { ExternalUsername = user, BrowserProof = Request.Headers["X-TouchQue-Browser"], ClientIp = ip });
+var risk = await tq.Risk.CheckAsync(new RiskCheckOptions { ExternalUsername = user, BrowserProof = Request.Headers["X-Touchque-Browser"], ClientIp = ip });
 if (!risk.Prompt) SignIn(user);   // a known browser, nothing new: no push
 ```
 
@@ -165,12 +183,12 @@ lists a user's known browsers, `ForgetBrowsersAsync()` forgets them (after a pas
 
 - `tq.WebAuthn`: registration, second factor and passwordless sign-in options/verify, list and delete passkeys.
 - `tq.Offline`: QR challenge and typed codes with the phone offline; `TotpVerifiersAsync` +
-  `OfflineResource.MatchTotpVerifier` check time-based codes while TouchQue is unreachable.
+  `OfflineResource.MatchTotpVerifier` check time-based codes while Touchque is unreachable.
 - `tq.Recovery` (Never Locked Out): vouchers, `StartAsync` (show `BindUri` as a QR), `StatusAsync`, `VetoAsync`.
 - `tq.Assist` (help desk): `OpenAsync`, `VerifyAsync` (a 2-digit code the agent reads to the person), `SpendAsync`, `UnfreezeAsync`, `EndAsync`.
 - `ApprovalProof.Verify(proof, options)`: the phone's own signature over what it showed ("what you see is what you sign").
 
-## TouchQue Actions
+## Touchque Actions
 
 ```csharp
 await tq.Actions.DeployAsync("night-alert", new DeployActionOptions
@@ -181,7 +199,7 @@ await tq.Actions.DeployAsync("night-alert", new DeployActionOptions
 var replay = await tq.Actions.DryRunAsync(new DryRunActionOptions { Trigger = "login.request", Code = code, Limit = 500 });
 ```
 
-Plus `TestAsync`, `RollbackAsync`, `LogsAsync`, `MetricsAsync`, `TemplatesAsync`, `Secrets`. Action code is JavaScript run by TouchQue in a sandbox, whatever language your server is in. Action types: `tq.ActionTypes.DefineAsync("SEND_MONEY", "Send money", critical: true)`.
+Plus `TestAsync`, `RollbackAsync`, `LogsAsync`, `MetricsAsync`, `TemplatesAsync`, `Secrets`. Action code is JavaScript run by Touchque in a sandbox, whatever language your server is in. Action types: `tq.ActionTypes.DefineAsync("SEND_MONEY", "Send money", critical: true)`.
 
 ## AI agents
 
@@ -192,7 +210,7 @@ var keys = AgentKeys.Generate();                       // where the agent runs; 
 var agent = await tq.Agents.CreateAsync(new CreateAgentOptions { Name = "Invoice bot", AllowedTypes = ["PAY_INVOICE"], PublicKey = keys.PublicJwk });
 
 // The agent (TQ_AGENT_ID, TQ_AGENT_KEY): private_key_jwt + DPoP, never your API key.
-using var bot = new TouchQueAgent();
+using var bot = new TouchqueAgent();
 var approved = await bot.RequireApprovalAsync("ayse@acme.com", "PAY_INVOICE", new[] { payment },
     onChallenge: s => Say($"Type {s.ChallengeCode} on your phone"));
 
@@ -202,14 +220,14 @@ var used = await tq.Agents.RedeemApprovalAsync(approved.ApprovalToken!, new Appr
 
 Also: mandates (`RequestMandateAsync`), the token vault (`tq.Agents.Vault`, `bot.GetConnectionTokenAsync`),
 policies, blocks, the kill switch, offline token checks (`VerifyApprovalTokenAsync`).
-`TouchQueOrgAgent` is an organization's agent on TouchQue SSO (DPoP tokens for one app, token
+`TouchqueOrgAgent` is an organization's agent on Touchque SSO (DPoP tokens for one app, token
 exchange, CIBA, the token vault, shared accounts; GitHub Actions and Kubernetes tokens instead of
-a stored key). `McpAuth` protects an MCP server whose authorization server is TouchQue SSO
-(`app.MapTouchQueMcpMetadata(auth)`, `.RequireTouchQueMcp(auth)`).
+a stored key). `McpAuth` protects an MCP server whose authorization server is Touchque SSO
+(`app.MapTouchqueMcpMetadata(auth)`, `.RequireTouchqueMcp(auth)`).
 
 ### Cross App Access (ID-JAG) and A2A agent cards
 
-An organization's identity provider (TouchQue SSO) can let one of its apps reach another service for a member with no consent screen (Cross App Access, ID-JAG, an open IETF draft): the app trades the member's ID token for an ID-JAG, then the ID-JAG for an access token at the other service. If you run an authorization server, the verifier checks an ID-JAG (issuer, single audience, your client, expiry, `typ`) and uses it once. Before your agent trusts another agent's A2A card, check its signatures (A2A 1.0 §8.4: JWS over the RFC 8785 canonical card); keys named by `jku` are only fetched from the card's own host or hosts you trust.
+An organization's identity provider (Touchque SSO) can let one of its apps reach another service for a member with no consent screen (Cross App Access, ID-JAG, an open IETF draft): the app trades the member's ID token for an ID-JAG, then the ID-JAG for an access token at the other service. If you run an authorization server, the verifier checks an ID-JAG (issuer, single audience, your client, expiry, `typ`) and uses it once. Before your agent trusts another agent's A2A card, check its signatures (A2A 1.0 §8.4: JWS over the RFC 8785 canonical card); keys named by `jku` are only fetched from the card's own host or hosts you trust.
 
 ```csharp
 var jag = await CrossAppAccess.RequestIdJagAsync(new() { Issuer = "https://sso.touchque.com", ClientId = clientId,
@@ -240,7 +258,7 @@ app.MapPost("/ssf", async (HttpRequest req) =>
         if (ev.Name == "session-revoked") await EndSessionsAsync((string?)ev.Subject["email"]);
         return Results.StatusCode(202);
     }
-    catch (TouchQueSecurityEventException e)
+    catch (TouchqueSecurityEventException e)
     {
         return Results.Json(new { err = e.Error, description = e.Message }, statusCode: e.Error == "temporarily_unavailable" ? 503 : 400);
     }
@@ -251,12 +269,12 @@ var (sets, moreAvailable) = await SecurityEvents.PollAsync(new() { Url = pollUrl
 foreach (var (jti, set) in sets) await HandleAsync(await verifier.VerifyAsync(set));
 ```
 
-A refused SET throws `TouchQueSecurityEventException`; `Error` is the RFC 8935 code to answer with (`invalid_request`, `invalid_key`, `invalid_issuer`, `invalid_audience`), or `temporarily_unavailable` when the issuer's keys could not be read (answer 503: the transmitter tries again). A SET does not expire: keep the jtis you handled and skip a repeat. `SecurityEvents.Types` maps the short names to the event type URIs.
+A refused SET throws `TouchqueSecurityEventException`; `Error` is the RFC 8935 code to answer with (`invalid_request`, `invalid_key`, `invalid_issuer`, `invalid_audience`), or `temporarily_unavailable` when the issuer's keys could not be read (answer 503: the transmitter tries again). A SET does not expire: keep the jtis you handled and skip a repeat. `SecurityEvents.Types` maps the short names to the event type URIs.
 
-## TouchQue Login (hosted sign-in)
+## Touchque Login (hosted sign-in)
 
 ```csharp
-builder.Services.AddTouchQueLogin(o =>
+builder.Services.AddTouchqueLogin(o =>
 {
     o.Domain = "acme.login.touchque.com";
     o.ClientId = "…";
@@ -265,16 +283,16 @@ builder.Services.AddTouchQueLogin(o =>
 });
 app.UseAuthentication();
 app.UseAuthorization();
-app.MapTouchQueLogin();                                  // GET /login, /callback, /logout
+app.MapTouchqueLogin();                                  // GET /login, /callback, /logout
 app.MapGet("/account", (ClaimsPrincipal u) => u.FindFirstValue("email")).RequireAuthorization();
 ```
 
 The session is ASP.NET Core's cookie authentication; tokens are kept in it
 (`HttpContext.GetTokenAsync("access_token")`) and refreshed before they expire. Your API checks
-TouchQue Login access tokens with a bearer scheme:
+Touchque Login access tokens with a bearer scheme:
 
 ```csharp
-builder.Services.AddAuthentication().AddTouchQueBearer(o =>
+builder.Services.AddAuthentication().AddTouchqueBearer(o =>
 {
     o.Domain = "acme.login.touchque.com";
     o.Audience = "https://api.acme.com";
@@ -295,11 +313,11 @@ var e = await tq.Mobile.CreateEnrollmentAsync(userId);   // the app spends e.Enr
 var push = MobileResource.PushFromWebhook(webhookEvent);  // a MOBILE_PUSH webhook → APNs payload / FCM data
 ```
 
-Or give TouchQue your APNs key / FCM service account (`UpdateSettingsAsync`) and it pushes for you.
+Or give Touchque your APNs key / FCM service account (`UpdateSettingsAsync`) and it pushes for you.
 
 ## Pairing a browser by QR code
 
-Your page shows a QR code, the person scans it with the TouchQue app, and the phone that scanned is the one asked to approve, with number matching. Your page sends the thumbprint of its browser key (`@touchque/web` `browserKey.thumbprint()`); the nonce in the QR never leaves your server (TouchQue keeps its hash).
+Your page shows a QR code, the person scans it with the Touchque app, and the phone that scanned is the one asked to approve, with number matching. Your page sends the thumbprint of its browser key (`@touchque/web` `browserKey.thumbprint()`); the nonce in the QR never leaves your server (Touchque keeps its hash).
 
 ```csharp
 var p = await tq.QrPairings.CreateAsync(new CreateQrPairingOptions { KeyThumbprint = thumb, ClientIp = ip, UserAgent = userAgent });
@@ -314,7 +332,7 @@ if (now.State == "confirmed")
 
 ## A code typed back on the phone
 
-When a sign-in needs a code another service sent the person (a text message, WhatsApp, e-mail), ask them to type it on the phone instead. The phone encrypts it to a one-time key you made for this request: TouchQue only ever holds the ciphertext. Such a request lives 5 minutes.
+When a sign-in needs a code another service sent the person (a text message, WhatsApp, e-mail), ask them to type it on the phone instead. The phone encrypts it to a one-time key you made for this request: Touchque only ever holds the ciphertext. Such a request lives 5 minutes.
 
 ```csharp
 var key = CodeReply.NewKey();   // keep key.PrivateKey for this request
@@ -325,7 +343,7 @@ var code = status.Reply is { } r ? CodeReply.Open(key.PrivateKey, sent.RequestId
 
 ## Safe Guard (Safe transactions approved on the phone)
 
-TouchQueSafeGuard is a transaction guard for a Safe: a transaction runs only with approvals signed by the P-256 keys on its approvers' phones. You send the raw transaction; the phone decodes it itself, shows its own rows and signs what it computed with a key only its biometrics unlock. Delegatecalls, changes to the Safe and proxy upgrades are governance: scheduled, time-locked and vetoable. A phone without that key yet gets `409 crypto_key_missing`.
+TouchqueSafeGuard is a transaction guard for a Safe: a transaction runs only with approvals signed by the P-256 keys on its approvers' phones. You send the raw transaction; the phone decodes it itself, shows its own rows and signs what it computed with a key only its biometrics unlock. Delegatecalls, changes to the Safe and proxy upgrades are governance: scheduled, time-locked and vetoable. A phone without that key yet gets `409 crypto_key_missing`.
 
 ```csharp
 var tx = new SafeGuardTx
@@ -349,36 +367,36 @@ var payload = purpose == "approve"
     : SafeApproval.ScheduleCall(safe, check.GovernanceHash, [approval]);      // a call to the guard; runs after govDelay
 ```
 
-`SafeApproval.Verify` makes the guard's check off chain, so a co-signer or your own server never has to trust TouchQue: it computes the Safe transaction hash (EIP-712) and the governance hash from the raw fields, rebuilds the 149-byte message the phone signed and checks the P-256 signature. It refuses a high `s`, an approval that expired or is valid for more than a day, another approver index, and, when you pass `Rows` or `DisplayDigest` from your own decoding, rows the phone did not show. Without `Purpose` it checks only an ordinary approval (`approve`): an approval to schedule a governance change covers no Safe nonce or gas fields, so it is accepted only when you pass `Purpose = "schedule"`. `Reason` is `approval_malformed`, `public_key_invalid`, `approver_index_mismatch`, `approval_expired`, `rows_differ`, `high_s` or `signature_invalid`. `SafeApproval.SafeTxHash`, `GovernanceHash`, `Message` and `DisplayDigest` are public too.
+`SafeApproval.Verify` makes the guard's check off chain, so a co-signer or your own server never has to trust Touchque: it computes the Safe transaction hash (EIP-712) and the governance hash from the raw fields, rebuilds the 149-byte message the phone signed and checks the P-256 signature. It refuses a high `s`, an approval that expired or is valid for more than a day, another approver index, and, when you pass `Rows` or `DisplayDigest` from your own decoding, rows the phone did not show. Without `Purpose` it checks only an ordinary approval (`approve`): an approval to schedule a governance change covers no Safe nonce or gas fields, so it is accepted only when you pass `Purpose = "schedule"`. `Reason` is `approval_malformed`, `public_key_invalid`, `approver_index_mismatch`, `approval_expired`, `rows_differ`, `high_s` or `signature_invalid`. `SafeApproval.SafeTxHash`, `GovernanceHash`, `Message` and `DisplayDigest` are public too.
 
 ## Errors, case codes and retries
 
 | Exception | When |
 | --- | --- |
-| `TouchQueApiException` | TouchQue answered with an error: `Status`, `Code` (`device_not_linked`, `already_used`…), `CaseCode`, `RetryAfter`, `Body` |
-| `TouchQueNetworkException` | the request never reached TouchQue (safe to retry) |
-| `TouchQueRejectedException`, `TouchQueTimeoutException`, `TouchQuePasskeyRequiredException` | `VerifyAsync` outcomes |
-| `TouchQueWebhookSignatureException`, `TouchQueWebhookReplayException` | webhooks |
-| `TouchQueApprovalException`, `TouchQueApprovalMismatchException` | agent approvals |
-| `TouchQueConfigException` | a missing key, an unknown action type, a wrong argument |
+| `TouchqueApiException` | Touchque answered with an error: `Status`, `Code` (`device_not_linked`, `already_used`…), `CaseCode`, `RetryAfter`, `Body` |
+| `TouchqueNetworkException` | the request never reached Touchque (safe to retry) |
+| `TouchqueRejectedException`, `TouchqueTimeoutException`, `TouchquePasskeyRequiredException` | `VerifyAsync` outcomes |
+| `TouchqueWebhookSignatureException`, `TouchqueWebhookReplayException` | webhooks |
+| `TouchqueApprovalException`, `TouchqueApprovalMismatchException` | agent approvals |
+| `TouchqueConfigException` | a missing key, an unknown action type, a wrong argument |
 
-A feature your organization cannot use here throws a `TouchQueFeatureException` (still a `TouchQueApiException`, status 403) with `Feature` (`device_risk`, `ai_agents`…) and `FeatureReason`: `TouchQueFeatureNotInPlanException`, `TouchQueFeatureReadOnlyException` or `TouchQueFeatureOffException` — not in its plan (an owner or admin adds it in the TouchQue dashboard), being turned off (reads work for 14 days, changes are refused) or switched off on this TouchQue deployment.
+A feature your organization cannot use here throws a `TouchqueFeatureException` (still a `TouchqueApiException`, status 403) with `Feature` (`device_risk`, `ai_agents`…) and `FeatureReason`: `TouchqueFeatureNotInPlanException`, `TouchqueFeatureReadOnlyException` or `TouchqueFeatureOffException` — not in its plan (an owner or admin adds it in the Touchque dashboard), being turned off (reads work for 14 days, changes are refused) or switched off on this Touchque deployment.
 
 **"Why?" case codes.** Refusals and pushes carry a 6-character case code (`K7P-2QX`): show it
 ("Tell your support team: K7P-2QX"); your team opens the whole decision by it in the dashboard.
 
 **Retries.** Every request is signed with a one-time nonce, so the SDK never replays one and you
-should not add a retry handler to the `TouchQue` HttpClient. Retry `TouchQueNetworkException` at
+should not add a retry handler to the `Touchque` HttpClient. Retry `TouchqueNetworkException` at
 the call site; on 429 / 423 wait `RetryAfter` seconds. The client never follows redirects and
 refuses plain `http://` except for localhost.
 
-**HttpClient.** `AddTouchQue()` registers the named client `TouchQue` (no redirects, connections
+**HttpClient.** `AddTouchque()` registers the named client `Touchque` (no redirects, connections
 recycled every 5 minutes) and returns its `IHttpClientBuilder` for logging or a proxy. Outside
-DI pass your own: `new TouchQueClient(options, httpClient)`.
+DI pass your own: `new TouchqueClient(options, httpClient)`.
 
 ## Logging
 
-The SDK writes nothing to the console on its own. To see its own problems (a misconfigured guard, a failed `OnChallenge`, a relay without `GetLoginUser`), set `TouchQueOptions.Logger` to an `ILogger` (`loggerFactory.CreateLogger("TouchQue")`), or `Debug = true` for `Console.Error`. Lines carry an error's type and message, never the request.
+The SDK writes nothing to the console on its own. To see its own problems (a misconfigured guard, a failed `OnChallenge`, a relay without `GetLoginUser`), set `TouchqueOptions.Logger` to an `ILogger` (`loggerFactory.CreateLogger("Touchque")`), or `Debug = true` for `Console.Error`. Lines carry an error's type and message, never the request.
 
 ## Development
 
