@@ -19,8 +19,9 @@ dotnet add package Touchque.AspNetCore   # ASP.NET Core (brings Touchque)
 dotnet add package Touchque              # anything else: workers, consoles, Azure Functions
 ```
 
-> **Not on NuGet yet.** Until it is, add the projects `src/Touchque` and `src/Touchque.AspNetCore` from
-> [this repository](https://github.com/Touchque/touchque-dotnet) to your solution.
+> **Not on NuGet yet.** Until it is, clone [this repository](https://github.com/Touchque/touchque-dotnet) and add
+> `src/Touchque/Touchque.csproj` and `src/Touchque.AspNetCore/Touchque.AspNetCore.csproj` to your solution where they
+> are (`dotnet sln add …`): they take net8.0 and their compiler settings from the repository's `Directory.Build.props`.
 
 The packages, assemblies and namespaces are `Touchque` and `Touchque.AspNetCore` (`using Touchque;`, `using Touchque.AspNetCore;`). Coming from 4.x, where the namespaces were spelled with a capital Q: see the 5.0.0 entry in the [CHANGELOG](CHANGELOG.md).
 
@@ -102,7 +103,8 @@ await tq.ActionTypes.DefineAsync("SEND_MONEY", name: "Send money", critical: tru
 The guard refuses what is not ready. A name that is not defined is a setup error
 (`TouchqueConfigException`, "Unknown action …"): the guard answers 500 with `reason: "misconfigured"`. A type
 turned off in the dashboard answers 403 with `reason: "action_disabled"`, which stops that kind of
-approval at once, without a deploy.
+approval at once, without a deploy. These answers come for a
+user whose phone is linked: a user without one is first shown the phone-linking step.
 
 ## The three primitives (any framework)
 
