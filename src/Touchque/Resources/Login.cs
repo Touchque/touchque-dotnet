@@ -318,6 +318,9 @@ public sealed record LoginStatus : TouchqueObject
     public string? RevokeReason { get; init; }
     /// <summary>A request made with Reply, once the person typed it back: the ciphertext only (<see cref="CodeReply.Open"/>).</summary>
     public LoginReply? Reply { get; init; }
+    /// <summary>When the request expires (ISO 8601; a Vishing Shield escalation to a passkey extends it), null when the API did not say or sent no string.</summary>
+    [System.Text.Json.Serialization.JsonConverter(typeof(LenientStringConverter))]
+    public string? ExpiresAt { get; init; }
 }
 
 public sealed record VerifyResult : TouchqueObject

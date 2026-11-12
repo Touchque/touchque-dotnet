@@ -510,6 +510,104 @@ public class ContractTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task WaitingPollsRepeatTheRequestsExpiry()
+    {
+        await _api.LinkAsync("rx@acme.com");
+        var tq = _api.Client();
+        var first = await Guard.RunAsync(tq, G("rx@acme.com"));
+        var expiresAt = (string)Step(first)["expiresAt"]!;
+        var rx = DateTimeOffset.Parse(expiresAt, System.Globalization.CultureInfo.InvariantCulture).ToUnixTimeMilliseconds();
+        long? Rx(GuardResult r) => GuardToken.Verify("test_secret", Token(r))!.RequestExpiresAt;
+        Assert.Equal(rx, Rx(first));
+        // Every later poll in waiting carries the same expiresAt, so a page can stop by time on the latest answer.
+        var poll = await Guard.RunAsync(tq, G("rx@acme.com", Token(first)));
+        var again = await Guard.RunAsync(tq, G("rx@acme.com", Token(poll)));
+        Assert.Equal(("waiting", expiresAt, "waiting", expiresAt),
+            ((string?)Step(poll)["state"], (string?)Step(poll)["expiresAt"], (string?)Step(again)["state"], (string?)Step(again)["expiresAt"]));
+        Assert.Equal(rx, Rx(again));
+        // Through the offline QR, its token keeps rx.
+        var offline = await Guard.RunAsync(tq, G("rx@acme.com", Token(again), offline: true));
+        Assert.Equal(("offline", (long?)rx), ((string?)Step(offline)["state"], Rx(offline)));
+        // Vishing Shield: the escalation to a passkey extends the request to 180 s. The polls take the live expiry and keep it.
+        await _api.EscalateAsync();
+        var passkey = await Guard.RunAsync(tq, G("rx@acme.com", Token(offline)));
+        var extended = (string)Step(passkey)["expiresAt"]!;
+        var live = DateTimeOffset.Parse(extended, System.Globalization.CultureInfo.InvariantCulture).ToUnixTimeMilliseconds();
+        Assert.True(live > rx + 100_000 && Math.Abs(live - DateTimeOffset.UtcNow.AddSeconds(180).ToUnixTimeMilliseconds()) < 30_000, extended);
+        Assert.Equal(("passkey_required", (long?)live), ((string?)Step(passkey)["state"], Rx(passkey)));
+        var passkeyAgain = await Guard.RunAsync(tq, G("rx@acme.com", Token(passkey)));
+        Assert.Equal(("passkey_required", extended), ((string?)Step(passkeyAgain)["state"], (string?)Step(passkeyAgain)["expiresAt"]));
+        // A 5.1 token (no rx) gets the live expiry too.
+        var old = Steps.VerifyGuardToken("test_secret", Token(first))!;
+        old.Remove("rx");
+        var legacy = await Guard.RunAsync(tq, G("rx@acme.com", Steps.SignGuardToken("test_secret", old)));
+        Assert.Equal(("passkey_required", extended), ((string?)Step(legacy)["state"], (string?)Step(legacy)["expiresAt"]));
+    }
+
+    [Fact]
+    public async Task APollTakesTheStatusAnswersExpiryElseTheTokens()
+    {
+        object status = new { status = "PENDING" };
+        var http = new HttpClient(new StubHandler((_, _) => StubHandler.Json(200, status)));
+        var tq = new TouchqueClient(new TouchqueOptions { ApiKey = "tq_x", ApiSecret = "s", BaseUrl = "https://api.example" }, http);
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var waiting = new GuardTokenClaims { User = "s@acme.com", Action = "LOGIN", State = "waiting", RequestId = "r1", ExpiresAt = now + 60_000 };
+        var withRx = GuardToken.Sign("s", waiting with { RequestExpiresAt = now + 20_000 });
+        var withoutRx = GuardToken.Sign("s", waiting);
+        var kept = Steps.Iso(now + 20_000);
+        var later = Steps.Iso(now + 90_000);
+        var seen = new List<(string?, string?, long?)>();
+        foreach (var answer in new object[]
+        {
+            new { status = "PENDING" }, new { status = "PENDING", expiresAt = "soon" }, new { status = "PENDING", expiresAt = (object)(now + 30_000) },
+            new { status = "PENDING", expiresAt = (object)later },
+        })
+        {
+            status = answer;
+            foreach (var token in new[] { withRx, withoutRx })
+            {
+                var r = await Guard.RunAsync(tq, G("s@acme.com", token));
+                seen.Add(((string?)Step(r)["state"], (string?)Step(r)["expiresAt"], GuardToken.Verify("s", Token(r))!.RequestExpiresAt));
+            }
+        }
+        // No expiry in the status answer, one that does not parse, or one that is not a string: the token's (none without rx).
+        // One that parses wins and is kept.
+        Assert.Equal(new (string?, string?, long?)[]
+        {
+            ("waiting", kept, now + 20_000), ("waiting", null, null),
+            ("waiting", kept, now + 20_000), ("waiting", null, null),
+            ("waiting", kept, now + 20_000), ("waiting", null, null),
+            ("waiting", later, now + 90_000), ("waiting", later, now + 90_000),
+        }, seen);
+        // An answer that does not fit at all (a status that is not a string) is an outage: 503, never a throw.
+        status = new { status = 5 };
+        var unreadable = await Guard.RunAsync(tq, G("s@acme.com", withRx));
+        Assert.Equal((503, "unavailable"), (unreadable.Status, (string?)Step(unreadable)["reason"]));
+    }
+
+    [Fact]
+    public async Task EnrollFalseAnswersEnrollmentOff()
+    {
+        var tq = _api.Client();
+        var guarded = await Guard.RunAsync(tq, G("nophone@acme.com") with { Enroll = false });
+        Assert.Equal(202, guarded.Status);
+        JsonAssert.Equal(new { state = "enroll", reason = "enrollment_off" }, Step(guarded));
+        var started = await tq.StartAsync("LOGIN", new StartOptions { User = "nophone@acme.com", Enroll = false });
+        Assert.Equal(("enroll", "enrollment_off"), (started.State, started.Reason));
+        // The relay's /login without GetLoginUser (a typed username proves nothing) answers the same.
+        var relay = new Relay.RelayHandler<string>(tq, new Relay.RelayOptions<string> { GetUserId = u => u });
+        var typed = (await relay.HandleAsync(new Relay.RelayRequest<string>
+        {
+            Method = "POST", Path = "/login", Ip = "203.0.113.9", Native = "x", Header = _ => null,
+            Body = new JsonObject { ["externalUsername"] = "nophone@acme.com" },
+        }))!;
+        Assert.Equal(202, typed.Status);
+        JsonAssert.Equal(new { state = "enroll", reason = "enrollment_off" }, typed.Body["touchque"]);
+        // No first-time QR was made for anyone.
+        Assert.All(await _api.CallsAsync(), c => Assert.Equal("/login/request", (string?)c!["path"]));
+    }
+
+    [Fact]
     public async Task FirstWaitingStepCarriesTheMirrorCanaryPollsDoNot()
     {
         await _api.LinkAsync("canary@acme.com");

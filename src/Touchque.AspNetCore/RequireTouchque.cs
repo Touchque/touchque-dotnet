@@ -1,6 +1,5 @@
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -52,7 +51,10 @@ public sealed class TouchqueGuardOptions
     /// </summary>
     public SilentSignInOptions? SilentSignIn { get; set; }
 
-    /// <summary>False: never show the first-time linking QR.</summary>
+    /// <summary>
+    /// False: never show the first-time linking QR. A user with no phone then gets 202
+    /// <c>{"state": "enroll", "reason": "enrollment_off"}</c>.
+    /// </summary>
     public bool Enroll { get; set; } = true;
 
     /// <summary>
@@ -137,9 +139,6 @@ internal static class TouchqueGuardRunner
             http.Items[TouchqueHttpContextExtensions.ApprovalKey] = result.Approved;
             return null;
         }
-        http.Response.Headers.CacheControl = "no-store";
-        if (result.RetryAfter is { } ra) http.Response.Headers.RetryAfter = ra.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        foreach (var (name, value) in result.RefusalHeaders) http.Response.Headers[name] = value;
         return Answer(http, result, options.ErrorBody, client, mvc);
     }
 
@@ -163,32 +162,22 @@ internal static class TouchqueGuardRunner
         }
     }
 
-    /// <summary>The body to send: the guard's, or for a refusal (400 or more) the ErrorBody's when one is set.</summary>
-    private static IResult Answer(HttpContext http, GuardResult result, Func<GuardRefusal, object?>? errorBody, TouchqueClient? client, bool mvc)
+    /// <summary>
+    /// The answer of a result that is not an approval, shared by <c>RequireTouchque</c>,
+    /// <c>[RequireTouchque]</c> and <c>GuardResult.ToResult</c>: sets its headers and returns its
+    /// body, the guard's or for a refusal (400 or more) the ErrorBody's, written with the app's JSON
+    /// options.
+    /// </summary>
+    internal static IResult Answer(HttpContext http, GuardResult result, Func<GuardRefusal, object?>? errorBody, TouchqueClient? client, bool mvc)
     {
-        var refusal = errorBody is null ? null : GuardRefusal.From(result);
-        if (refusal is not null)
-        {
-            try
-            {
-                // An object is decided by its JSON encoding with the app's options; what they cannot write falls back below.
-                var value = errorBody!(refusal);
-                var node = value is null ? null : JsonNode.Parse(JsonSerializer.SerializeToUtf8Bytes(value, value.GetType(), SerializerOptions(http, mvc)));
-                if (node is JsonObject o)
-                {
-                    // The SDK's key wins, so @touchque/web still sees the state: no other spelling of it is left.
-                    foreach (var key in o.Select(p => p.Key).Where(k => string.Equals(k, "touchque", StringComparison.OrdinalIgnoreCase)).ToList()) o.Remove(key);
-                    o["touchque"] = result.Body!["touchque"]!.DeepClone();
-                }
-                return node is null ? Results.Text("null", "application/json", Encoding.UTF8, result.Status) : Results.Json(node, statusCode: result.Status);
-            }
-            catch (Exception e)
-            {
-                Log(http, client).Error("[Touchque] errorBody failed: " + e.Message);
-            }
-        }
-        return Results.Json(result.Body, statusCode: result.Status);
+        var answer = Guard.Answer(result, errorBody, errorBody is null ? null : SerializerOptions(http, mvc), errorBody is null ? null : Log(http, client));
+        foreach (var (name, value) in answer.Headers) http.Response.Headers[name] = value;
+        return answer.Body is null ? Results.Text("null", "application/json", Encoding.UTF8, answer.Status) : Results.Json(answer.Body, statusCode: answer.Status);
     }
+
+    /// <summary>The request runs a controller action (or a Razor page): MVC's JSON options apply.</summary>
+    internal static bool IsMvc(HttpContext http) =>
+        http.GetEndpoint()?.Metadata.GetMetadata<Microsoft.AspNetCore.Mvc.Abstractions.ActionDescriptor>() is not null;
 
     /// <summary>The app's JSON options: MVC's for a controller action, else the minimal APIs' ones.</summary>
     private static JsonSerializerOptions SerializerOptions(HttpContext http, bool mvc) =>
@@ -202,6 +191,52 @@ internal static class TouchqueGuardRunner
         if (client is not null) return client.Log;
         var o = http.RequestServices.GetService<IOptions<TouchqueOptions>>()?.Value;
         return new SdkLog(o?.Logger, o?.Debug ?? false);
+    }
+}
+
+/// <summary>
+/// A guard result that is not an approval as its HTTP answer, exactly as <c>RequireTouchque</c>,
+/// <c>[RequireTouchque]</c> and <c>MapTouchqueRelay</c> send it (they share the code): the status,
+/// <c>Cache-Control: no-store</c>, <c>Retry-After</c> on 423 and 429, <c>X-Touchque-State</c> and
+/// <c>X-Touchque-Reason</c> on a refusal, and the JSON body. For a guard inside your handler:
+/// <code>
+/// if (r.Approved is null) return r.ToResult();
+/// </code>
+/// </summary>
+public static class TouchqueGuardResultExtensions
+{
+    /// <summary>
+    /// The answer as an <see cref="IResult"/>. <paramref name="errorBody"/> (null: the guard's body)
+    /// shapes refusals (400 or more) like <see cref="TouchqueGuardOptions.ErrorBody"/>, written with
+    /// the app's JSON options: MVC's in a controller action, else the minimal APIs' ones. A callback
+    /// that throws, or a result the serializer cannot write, sends the default body and logs
+    /// <c>[Touchque] errorBody failed: &lt;message&gt;</c> through <see cref="TouchqueOptions.Logger"/>.
+    /// </summary>
+    /// <exception cref="ArgumentException">The result is an approval: run your action instead.</exception>
+    public static IResult ToResult(this GuardResult result, Func<GuardRefusal, object?>? errorBody = null)
+    {
+        if (result.Approved is not null) throw new ArgumentException("A guard answer is a step or a refusal; on approval, run your action.", nameof(result));
+        return new GuardHttpResult(result, errorBody);
+    }
+
+    /// <summary>Writes <see cref="ToResult"/>'s answer to <paramref name="http"/>'s response.</summary>
+    /// <exception cref="ArgumentException">The result is an approval: run your action instead.</exception>
+    public static Task WriteAsync(this GuardResult result, HttpContext http, Func<GuardRefusal, object?>? errorBody = null) =>
+        result.ToResult(errorBody).ExecuteAsync(http);
+
+    private sealed class GuardHttpResult : IResult
+    {
+        private readonly GuardResult _result;
+        private readonly Func<GuardRefusal, object?>? _errorBody;
+
+        public GuardHttpResult(GuardResult result, Func<GuardRefusal, object?>? errorBody)
+        {
+            _result = result;
+            _errorBody = errorBody;
+        }
+
+        public Task ExecuteAsync(HttpContext httpContext) =>
+            TouchqueGuardRunner.Answer(httpContext, _result, _errorBody, client: null, TouchqueGuardRunner.IsMvc(httpContext)).ExecuteAsync(httpContext);
     }
 }
 

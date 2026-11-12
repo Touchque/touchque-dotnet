@@ -86,7 +86,8 @@ one. A page on another origin must expose them (`Access-Control-Expose-Headers`)
 
 The approving user is the signed-in user's `email` claim, else `sub`, else the name. For your
 login endpoint (nobody is signed in yet) set `o.User = c => …` to whoever just passed your
-password check.
+password check. `o.Enroll = false` never shows a first-time QR: a user with no phone gets 202
+with reason `enrollment_off`.
 
 **The end user's address.** The risk checks (Tor, location, impossible travel) and the location
 shown on the phone use `HttpContext.Connection.RemoteIpAddress`. Behind a load balancer add
@@ -138,7 +139,8 @@ It is a 500 and not a 503 because it is a setup mistake to fix, not an outage to
 `@touchque/web` shows "Approvals are not set up correctly on this site." The SDK logs it once
 through `TouchqueOptions.Logger` (or `Debug`): `[Touchque] TQ_API_KEY and TQ_API_SECRET are not set: routes guarded by Touchque answer 500 misconfigured.`
 `MapTouchqueRelay` still needs the keys when the app starts, and the webhook endpoint when a
-delivery arrives.
+delivery arrives. A guard inside your own handler answers the same with `Guard.WithoutClient(input)`
+(see below).
 
 ## Action types
 
@@ -171,55 +173,87 @@ var approval = await tq.CompleteAsync(step.RequestId!, new CompleteExpectations
 
 `Guard.RunAsync` is the whole two-phase contract of `RequireTouchque` as one call, for any
 framework (minimal APIs, controllers, Azure Functions). Use it when your own checks must come
-first:
+first. `r.ToResult()` turns its answer into the status, headers and JSON body that
+`RequireTouchque`, `[RequireTouchque]` and `MapTouchqueRelay` send (they share the code):
 
 ```csharp
-app.MapPost("/transfer", async (Transfer t, HttpContext http, TouchqueClient tq) =>
+app.MapPost("/transfer", async (Transfer t, HttpContext http) =>
 {
     var user = http.User.TouchqueUser();
     // 1. Your own checks first (ownership, balance): a request you refuse anyway never reaches the phone.
     if (!await accounts.CanSendAsync(user, t.Amount)) return Results.Conflict(new { error = "insufficient_funds" });
 
     var h = http.Request.Headers;
-    var r = await Guard.RunAsync(tq, new GuardInput
+    var input = new GuardInput
     {
         User = user, Action = "SEND_MONEY", Details = [("Amount", t.Amount), ("To", t.To)],
         Ip = http.TouchqueClientIp(), UserAgent = h.UserAgent,
         Token = h[Guard.TokenHeader], Offline = h[Guard.OfflineHeader] == "1",
         Code = h[Guard.CodeHeader], CodeType = h[Guard.CodeTypeHeader],
-    }, http.RequestAborted);
-    if (r.Approved is null)
+    };
+    GuardResult r;
+    try
     {
-        // 2. A step (202) or a refusal: send r.Status and r.Body as they are.
-        http.Response.Headers.CacheControl = "no-store";
-        if (r.RetryAfter is { } seconds) http.Response.Headers.RetryAfter = seconds.ToString(CultureInfo.InvariantCulture);   // 423, 429
-        foreach (var (name, value) in r.RefusalHeaders) http.Response.Headers[name] = value;   // X-Touchque-State, X-Touchque-Reason
-        return Results.Json(r.Body, statusCode: r.Status);
+        // The client AddTouchque registers, resolved per request: built on the first one, never at startup.
+        r = await Guard.RunAsync(http.RequestServices.GetRequiredService<TouchqueClient>(), input, http.RequestAborted);
     }
+    catch (TouchqueConfigException)
+    {
+        r = Guard.WithoutClient(input);   // no TQ_API_KEY / TQ_API_SECRET yet: 500 misconfigured (401 without a user)
+    }
+    // 2. A step (202) or a refusal: its status, headers (Cache-Control, Retry-After, X-Touchque-*) and JSON body.
+    if (r.Approved is null) return r.ToResult();
     // 3. Approved: run the action once. The approval is used up.
     return Results.Ok(await payments.SendAsync(t));
 });
 ```
 
+- The client: resolve it per request from `http.RequestServices` and answer
+  `Guard.WithoutClient(input)` while it cannot be built. That client reads `AddTouchque`'s options,
+  then the environment. Do not take `TouchqueClient` as a handler parameter: it is resolved before
+  your code runs, and without keys it throws `TouchqueConfigException` outside your `try`.
+- Keys in the environment only (no options in `AddTouchque`, or no `AddTouchque`): pass `null`.
+  `Guard.RunAsync(null, input)` uses `Guard.DefaultClient()`, built from `TQ_API_KEY`,
+  `TQ_API_SECRET` and `TQ_API_URL` on the first request and kept (a failed build is tried again on
+  the next one). It never reads `AddTouchque`'s options. While it cannot be built, the answer is
+  401 `unauthenticated` without a user, else 500 `misconfigured`, and
+  `Guard.IsStatusPoll(null, input)` is false.
+- That null-client path logs nothing: the SDK's logger belongs to a client, and it is silent by
+  default. To fail fast, call `Guard.DefaultClient()` at startup: it throws
+  `TouchqueConfigException`, naming the problem. To give the path a logger, set a client built with
+  one: `Guard.SetDefaultClient(new TouchqueClient(new TouchqueOptions { Logger = logger }))`.
+  `Guard.SetDefaultClient(null)` forgets it, and the next call builds one from the environment again.
 - Run it after your own checks (ownership, balance), with the details the phone shows, built on
   your server.
-- Not approved: answer `r.Status` with `r.Body` as JSON and `Cache-Control: no-store`. On 423 and
-  429 add `Retry-After: r.RetryAfter`. On a refusal, add `r.RefusalHeaders`.
+- Not approved: return `r.ToResult(errorBody)`, or `await r.WriteAsync(http, errorBody)` where you
+  write the response yourself. Its headers are `Cache-Control: no-store`, `Retry-After` on 423 and
+  429, and on a refusal `X-Touchque-State` and `X-Touchque-Reason`. `errorBody` is your shape for
+  refusals, with the [`ErrorBody`](#refusals-in-your-apps-error-shape-errorbody) rules: written
+  with your app's JSON options (MVC's in a controller action), and a failure is logged through
+  `TouchqueOptions.Logger`.
 - Approved (`r.Approved` is set): run the action once. A replay of the same token is refused.
 - 202 `{"touchque": step, "token": "..."}`: the page shows the step and sends the same request
   again with `X-Touchque-Token: <token>`, every ~1.5 s (`touchqueFetch` from `@touchque/web` does
   this). The token is bound to the user, action, details and `ReferenceId`.
+- Waiting polls (`waiting`, `passkey_required`) carry the request's `expiresAt` on every answer,
+  not only the first, so a page can stop by time on the latest one. It is the live expiry from
+  Touchque's status answer: a Vishing Shield escalation to a passkey extends it to 180 s.
 - While the first-time QR is up, polls answer `{state: "enroll", expiresAt}` without `enroll`:
-  keep showing the QR you have. A new QR comes with `enroll.qrCodeDataUrl` when the old one
-  expired. Pages on @touchque/web need 2.1.0.
+  keep showing the QR you have. About 15 s before it expires, a new QR comes with
+  `enroll.qrCodeDataUrl`, together with new recovery codes; the old QR and the old codes stop
+  working. Pages on @touchque/web need 2.1.0.
+- `Enroll = false` never shows a first-time QR: a user with no phone gets 202
+  `{"state": "enroll", "reason": "enrollment_off"}`. `@touchque/web` 2.2.0 stops polling there and
+  says no phone is linked yet.
+- A 202 state other than `waiting` or `enroll` (`passkey_required`, `offline`, an `enroll` with a
+  reason) needs `@touchque/web`, or your own UI following this contract.
 - `Guard.IsStatusPoll(tq, input)` is true for a poll that only reads a state (a push on its way,
   or a first-time QR with more than 15 s left), so your own rate limit can let it through. If it
   does, charge what such a poll may still start in `BeforeStart = async () => …`: the guard calls
   it once, right before a first-time QR poll starts a push (the phone got linked) or a new QR, and
   answers your result instead when you return one. `MapTouchqueRelay` does this, so every start
   is counted.
-- `GuardRefusal.From(r)` gives a refusal's status, code and message for your own error body. While
-  no client can be built, `Guard.WithoutClient(input)` answers what the guard answers then.
+- `GuardRefusal.From(r)` gives a refusal's status, code and message for your own error body.
 
 ## Waiting in one call
 
@@ -255,8 +289,10 @@ Routes: `POST /login`, `/enroll/start`, `GET /enroll/status`, `/offline/challeng
 `/passkey/authenticate/options|verify`, `/passkey/login/options|verify`,
 `/passkey/register/options|verify`, `GET /passkey/credentials`, `DELETE /passkey/credentials/{id}`.
 Pre-auth routes are rate limited (20 per IP, 5 per username a minute; `RateLimit = new() { Store = … }`
-for Redis across instances). The offline routes stay off until `GetLoginUser` is set. Adding a
-passkey for a user with a linked phone waits for the phone first.
+for Redis across instances). The offline routes stay off until `GetLoginUser` is set, and so does
+the first-time QR on `/login`: without `GetLoginUser`, a user with no phone gets 202
+`{"state": "enroll", "reason": "enrollment_off"}`. Adding a passkey for a user with a linked phone
+waits for the phone first.
 
 ## Webhooks
 

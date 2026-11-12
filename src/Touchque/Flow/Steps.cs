@@ -91,7 +91,10 @@ public sealed record StartOptions
     public string? BrowserProof { get; init; }
     /// <summary>For your Touchque Actions only (<c>event.context</c>).</summary>
     public IReadOnlyDictionary<string, object?>? Context { get; init; }
-    /// <summary>False: never show the first-time linking QR (a typed username proves nothing).</summary>
+    /// <summary>
+    /// False: never show the first-time linking QR (a typed username proves nothing). A user with no
+    /// phone then gets <c>enroll</c> with reason <c>enrollment_off</c>.
+    /// </summary>
     public bool Enroll { get; init; } = true;
 }
 
@@ -161,7 +164,8 @@ internal static class Steps
             var caseCode = e.CaseCode;
             if (e.Status == 404 && (code == "device_not_linked" || e.Message.Contains("linked device", StringComparison.OrdinalIgnoreCase)))
             {
-                return o.Enroll ? await EnrollStepAsync(client, o.User, ct).ConfigureAwait(false) : new Step { State = "enroll" };
+                // No QR may be shown here: say why, so a page stops instead of polling a step it cannot finish.
+                return o.Enroll ? await EnrollStepAsync(client, o.User, ct).ConfigureAwait(false) : new Step { State = "enroll", Reason = "enrollment_off" };
             }
             if (e.Status == 423) return new Step { State = "frozen", RetryAfter = e.RetryAfter, CaseCode = caseCode };
             if (e.Status == 429) return new Step { State = "rate_limited", RetryAfter = e.RetryAfter, CaseCode = caseCode };
@@ -232,7 +236,12 @@ internal static class Steps
     {
         var s = await client.Login.StatusAsync(requestId, ct).ConfigureAwait(false);
         var state = s.Status == "PENDING" && s.RequiresPasskey ? "passkey_required" : StateMap.GetValueOrDefault(s.Status, "waiting");
-        return new Step { State = state, RequestId = requestId, Assurance = state == "approved" ? s.Assurance : null };
+        // The request's live expiry: a Vishing Shield escalation to a passkey extends it.
+        return new Step
+        {
+            State = state, RequestId = requestId, ExpiresAt = string.IsNullOrEmpty(s.ExpiresAt) ? null : s.ExpiresAt,
+            Assurance = state == "approved" ? s.Assurance : null,
+        };
     }
 
     public static async Task<Approval> CompleteAsync(TouchqueClient client, string requestId, CompleteExpectations expect, CancellationToken ct)

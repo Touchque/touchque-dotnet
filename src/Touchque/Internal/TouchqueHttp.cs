@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace Touchque.Internal;
@@ -12,7 +13,7 @@ namespace Touchque.Internal;
 /// </summary>
 internal sealed class TouchqueHttp
 {
-    internal const string SdkVersion = "5.1.0";
+    internal const string SdkVersion = "5.2.0";
     private const int MaxResponseBytes = 10 * 1024 * 1024;
 
     private readonly HttpClient _client;
@@ -57,19 +58,32 @@ internal sealed class TouchqueHttp
         (await SendRawAsync(HttpMethod.Get, path, null, ct).ConfigureAwait(false)).Text;
 
     public async Task<T> GetAsync<T>(string path, IEnumerable<KeyValuePair<string, string?>>? query = null, CancellationToken ct = default) =>
-        Json.To<T>(await GetAsync(path, query, ct).ConfigureAwait(false));
+        Read<T>(await GetAsync(path, query, ct).ConfigureAwait(false));
 
     public async Task<T> PostAsync<T>(string path, JsonNode? body = null, CancellationToken ct = default) =>
-        Json.To<T>(await PostAsync(path, body, ct).ConfigureAwait(false));
+        Read<T>(await PostAsync(path, body, ct).ConfigureAwait(false));
 
     public async Task<T> PutAsync<T>(string path, JsonNode? body = null, CancellationToken ct = default) =>
-        Json.To<T>(await PutAsync(path, body, ct).ConfigureAwait(false));
+        Read<T>(await PutAsync(path, body, ct).ConfigureAwait(false));
 
     public async Task<T> PatchAsync<T>(string path, JsonNode? body = null, CancellationToken ct = default) =>
-        Json.To<T>(await PatchAsync(path, body, ct).ConfigureAwait(false));
+        Read<T>(await PatchAsync(path, body, ct).ConfigureAwait(false));
 
     public async Task<T> DeleteAsync<T>(string path, CancellationToken ct = default) =>
-        Json.To<T>(await DeleteAsync(path, ct).ConfigureAwait(false));
+        Read<T>(await DeleteAsync(path, ct).ConfigureAwait(false));
+
+    /// <summary>The answer as <typeparamref name="T"/>. One that does not fit is a network error (a guard answers 503), as in the Java SDK.</summary>
+    private static T Read<T>(JsonNode? node)
+    {
+        try
+        {
+            return Json.To<T>(node);
+        }
+        catch (JsonException e)
+        {
+            throw new TouchqueNetworkException("could not read the answer: " + e.Message, e);
+        }
+    }
 
     /// <summary>Deterministic query string: keys sorted, values URL-encoded, <c>?</c>-prefixed (or empty).</summary>
     internal static string BuildQuery(IEnumerable<KeyValuePair<string, string?>>? query)

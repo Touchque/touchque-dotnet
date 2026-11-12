@@ -5,7 +5,7 @@ namespace Touchque;
 
 /// <summary>
 /// What a guard token carries, under the same short names in every Touchque server SDK
-/// (u, a, d, r, st, rid, n, oc, cc, ee, exp): it binds a step to one user, action and transaction.
+/// (u, a, d, r, st, rid, n, oc, cc, ee, rx, exp): it binds a step to one user, action and transaction.
 /// </summary>
 public sealed record GuardTokenClaims
 {
@@ -29,6 +29,8 @@ public sealed record GuardTokenClaims
     public string? CaseCode { get; init; }
     /// <summary>ee: when the first-time linking QR of an <c>enroll</c> step expires, in Unix milliseconds; its polls keep that QR until then.</summary>
     public long? EnrollExpiresAt { get; init; }
+    /// <summary>rx: when the push or passkey request of a <c>waiting</c> / <c>passkey_required</c> step expires, in Unix milliseconds; its polls carry it as <c>expiresAt</c>.</summary>
+    public long? RequestExpiresAt { get; init; }
     /// <summary>exp: Unix milliseconds (not seconds).</summary>
     public required long ExpiresAt { get; init; }
 }
@@ -54,6 +56,7 @@ public static class GuardToken
         if (claims.OfflineChallengeId is not null) o["oc"] = claims.OfflineChallengeId;
         if (claims.CaseCode is not null) o["cc"] = claims.CaseCode;
         if (claims.EnrollExpiresAt is not null) o["ee"] = claims.EnrollExpiresAt;
+        if (claims.RequestExpiresAt is not null) o["rx"] = claims.RequestExpiresAt;
         o["exp"] = claims.ExpiresAt;
         return Steps.SignGuardToken(apiSecret, o);
     }
@@ -73,7 +76,7 @@ public static class GuardToken
         {
             User = u, Action = a, DetailsDigest = d, ReferenceId = Json.Str(c, "r"), State = st,
             RequestId = Json.Str(c, "rid"), Number = Json.Str(c, "n"), OfflineChallengeId = Json.Str(c, "oc"), CaseCode = Json.Str(c, "cc"),
-            EnrollExpiresAt = Json.Long(c, "ee"), ExpiresAt = exp.Value,
+            EnrollExpiresAt = Json.Long(c, "ee"), RequestExpiresAt = Json.Long(c, "rx"), ExpiresAt = exp.Value,
         };
     }
 }

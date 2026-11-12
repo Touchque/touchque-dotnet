@@ -148,30 +148,51 @@ internal static class ReadmeExamples
             .RequireTouchque("SEND_MONEY", o => o.ErrorBody = r => new { message = r.Message, code = r.Code });
         builder.Services.ConfigureAll<TouchqueGuardOptions>(o => o.ErrorBody = r => new { message = r.Message, code = r.Code });
 
-        app.MapPost("/transfer", async (Transfer t, HttpContext http, TouchqueClient tq) =>
+        app.MapPost("/transfer", async (Transfer t, HttpContext http) =>
         {
             var user = http.User.TouchqueUser();
             // 1. Your own checks first (ownership, balance): a request you refuse anyway never reaches the phone.
             if (!await accounts.CanSendAsync(user, t.Amount)) return Results.Conflict(new { error = "insufficient_funds" });
 
             var h = http.Request.Headers;
-            var r = await Guard.RunAsync(tq, new GuardInput
+            var input = new GuardInput
             {
                 User = user, Action = "SEND_MONEY", Details = [("Amount", t.Amount), ("To", t.To)],
                 Ip = http.TouchqueClientIp(), UserAgent = h.UserAgent,
                 Token = h[Guard.TokenHeader], Offline = h[Guard.OfflineHeader] == "1",
                 Code = h[Guard.CodeHeader], CodeType = h[Guard.CodeTypeHeader],
-            }, http.RequestAborted);
-            if (r.Approved is null)
+            };
+            GuardResult r;
+            try
             {
-                // 2. A step (202) or a refusal: send r.Status and r.Body as they are.
-                http.Response.Headers.CacheControl = "no-store";
-                if (r.RetryAfter is { } seconds) http.Response.Headers.RetryAfter = seconds.ToString(CultureInfo.InvariantCulture);   // 423, 429
-                foreach (var (name, value) in r.RefusalHeaders) http.Response.Headers[name] = value;   // X-Touchque-State, X-Touchque-Reason
-                return Results.Json(r.Body, statusCode: r.Status);
+                // The client AddTouchque registers, resolved per request: built on the first one, never at startup.
+                r = await Guard.RunAsync(http.RequestServices.GetRequiredService<TouchqueClient>(), input, http.RequestAborted);
             }
+            catch (TouchqueConfigException)
+            {
+                r = Guard.WithoutClient(input);   // no TQ_API_KEY / TQ_API_SECRET yet: 500 misconfigured (401 without a user)
+            }
+            // 2. A step (202) or a refusal: its status, headers (Cache-Control, Retry-After, X-Touchque-*) and JSON body.
+            if (r.Approved is null) return r.ToResult();
             // 3. Approved: run the action once. The approval is used up.
             return Results.Ok(await payments.SendAsync(t));
         });
+
+        // The bullets: the null client, an errorBody, WriteAsync, IsStatusPoll.
+        app.MapPost("/env", async (HttpContext http) =>
+        {
+            var input = new GuardInput { User = http.User.TouchqueUser(), Action = "SEND_MONEY", Enroll = false };
+            var r = await Guard.RunAsync(null, input, http.RequestAborted);
+            if (Guard.IsStatusPoll(null, input) || r.Approved is not null) return Results.Ok();
+            if (http.Request.Query.ContainsKey("write"))
+            {
+                await r.WriteAsync(http, refusal => new { message = refusal.Message, code = refusal.Code });
+                return Results.Empty;
+            }
+            return r.ToResult(refusal => new { message = refusal.Message, code = refusal.Code });
+        });
+        _ = Guard.DefaultClient();   // the fail-fast check at startup
+        Guard.SetDefaultClient(new TouchqueClient(new TouchqueOptions { Logger = null }));
+        Guard.SetDefaultClient(null);
     }
 }

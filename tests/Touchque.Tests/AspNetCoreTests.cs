@@ -56,6 +56,53 @@ public class AspNetCoreTests : IAsyncLifetime
 
     private static string? Header(HttpResponseMessage res, string name) => res.Headers.TryGetValues(name, out var v) ? string.Join(",", v) : null;
 
+    /// <summary>"Guard inside your handler" as the README shows it: the client resolved per request (Guard.WithoutClient while it cannot be built) and r.ToResult().</summary>
+    internal static async Task<IResult> HandlerAsync(HttpContext http, string action, Func<GuardRefusal, object?>? errorBody = null)
+    {
+        var h = http.Request.Headers;
+        var input = new GuardInput
+        {
+            User = http.User.TouchqueUser(), Action = action, Ip = http.TouchqueClientIp(), UserAgent = h.UserAgent,
+            Token = h[Guard.TokenHeader], Offline = h[Guard.OfflineHeader] == "1", Code = h[Guard.CodeHeader], CodeType = h[Guard.CodeTypeHeader],
+        };
+        GuardResult r;
+        try
+        {
+            r = await Guard.RunAsync(http.RequestServices.GetRequiredService<TouchqueClient>(), input, http.RequestAborted);
+        }
+        catch (TouchqueConfigException)
+        {
+            r = Guard.WithoutClient(input);
+        }
+        return r.Approved is null ? r.ToResult(errorBody) : Results.Ok(new { via = r.Approved.ConfirmedVia });
+    }
+
+    /// <summary>What two answers must share: two guard runs differ only in the token and the request's id and expiry.</summary>
+    private static async Task<(string[] Meta, JsonNode? Body)> AnswerAsync(HttpResponseMessage res)
+    {
+        var body = JsonNode.Parse(await res.Content.ReadAsStringAsync());
+        var token = body is JsonObject o && o.Remove("token");
+        if (body?["touchque"] is JsonObject step)
+        {
+            step.Remove("requestId");
+            step.Remove("expiresAt");
+        }
+        return (new[]
+        {
+            ((int)res.StatusCode).ToString(System.Globalization.CultureInfo.InvariantCulture), res.Content.Headers.ContentType?.MediaType ?? "",
+            res.Headers.CacheControl?.ToString() ?? "", res.Headers.RetryAfter?.ToString() ?? "",
+            Header(res, Guard.StateHeader) ?? "", Header(res, Guard.ReasonHeader) ?? "", token ? "token" : "",
+        }, body);
+    }
+
+    private static async Task AssertSameAnswerAsync(HttpResponseMessage expected, HttpResponseMessage actual, string because)
+    {
+        var (meta, body) = await AnswerAsync(expected);
+        var (otherMeta, otherBody) = await AnswerAsync(actual);
+        Assert.Equal(meta, otherMeta);
+        JsonAssert.Equal(body, otherBody, because);
+    }
+
     private static HttpRequestMessage Post(string path, string? user = null, string? token = null, object? body = null)
     {
         var req = new HttpRequestMessage(HttpMethod.Post, path) { Content = JsonContent.Create(body ?? new { }) };
@@ -96,6 +143,47 @@ public class AspNetCoreTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task AGuardInsideAHandlerAnswersExactlyLikeTheAdapters()
+    {
+        await _api.LinkAsync("ada@acme.com");
+        await _api.LinkAsync("cy@acme.com");
+        object? Shape(GuardRefusal r) => new { message = r.Message, code = r.Code };
+        await using var app = await AppAsync(a =>
+        {
+            a.MapPost("/account", () => Results.Ok()).RequireTouchque("LOGIN", o => o.ErrorBody = Shape);
+            a.MapPost("/plain", () => Results.Ok()).RequireTouchque("LOGIN");
+            a.MapPost("/undefined", () => Results.Ok()).RequireTouchque("NOT_DEFINED", o => o.ErrorBody = Shape);
+            a.MapPost("/handler/{action}", (HttpContext http, string action, bool? errorBody) => HandlerAsync(http, action, errorBody == true ? Shape : null));
+            a.MapTouchqueRelay("/touchque", new RelayOptions<HttpContext> { GetUserId = http => http.User.TouchqueUser(), GetLoginUser = http => http.User.TouchqueUser() });
+        });
+        var client = app.GetTestClient();
+        var statuses = new List<int>();
+        foreach (var scenario in new object[]
+        {
+            new { blocked = false, rateLimited = false, frozen = false }, new { blocked = "geo_policy", rateLimited = false, frozen = false },
+            new { blocked = false, rateLimited = true, frozen = false }, new { blocked = false, rateLimited = false, frozen = true },
+        })
+        {
+            await _api.OptsAsync(scenario);
+            // With an ErrorBody: RequireTouchque, and the handler passing the same one to ToResult.
+            var adapter = await client.SendAsync(Post("/account", "ada@acme.com"));
+            await AssertSameAnswerAsync(adapter, await client.SendAsync(Post("/handler/LOGIN?errorBody=true", "ada@acme.com")), "errorBody " + (int)adapter.StatusCode);
+            // Without: RequireTouchque, the relay's POST /login, and the handler with ToResult().
+            var plain = await client.SendAsync(Post("/plain", "cy@acme.com"));
+            await AssertSameAnswerAsync(plain, await client.SendAsync(Post("/handler/LOGIN", "cy@acme.com")), "plain " + (int)plain.StatusCode);
+            await AssertSameAnswerAsync(plain, await client.SendAsync(Post("/touchque/login", "cy@acme.com")), "relay " + (int)plain.StatusCode);
+            statuses.Add((int)adapter.StatusCode);
+            statuses.Add((int)plain.StatusCode);
+        }
+        // 500 misconfigured: an action the API does not know.
+        await _api.OptsAsync(new { blocked = false, rateLimited = false, frozen = false });
+        var misconfigured = await client.SendAsync(Post("/undefined", "ada@acme.com"));
+        await AssertSameAnswerAsync(misconfigured, await client.SendAsync(Post("/handler/NOT_DEFINED?errorBody=true", "ada@acme.com")), "500");
+        statuses.Add((int)misconfigured.StatusCode);
+        Assert.Equal(new[] { 202, 202, 403, 403, 429, 429, 423, 423, 500 }, statuses);
+    }
+
+    [Fact]
     public async Task WithoutKeysTheAppStartsAndAGuardedEndpointAnswers500MisconfiguredAndNeverRuns()
     {
         var logger = new ContractTests.ListLogger();
@@ -107,6 +195,7 @@ public class AspNetCoreTests : IAsyncLifetime
                 ran++;
                 return Results.Ok();
             }).RequireTouchque("SEND_MONEY");
+            a.MapPost("/handler/{action}", (HttpContext http, string action) => HandlerAsync(http, action));
             a.MapControllers();
         }, s => s.Configure<TouchqueOptions>(o =>
         {
@@ -132,6 +221,11 @@ public class AspNetCoreTests : IAsyncLifetime
             }, await res.Content.ReadFromJsonAsync<JsonObject>(), path);
         }
         Assert.Equal(0, ran);
+        // The README's guard inside a handler (the client resolved per request, else Guard.WithoutClient) answers the same.
+        foreach (var user in new[] { null, "ada@acme.com" })
+        {
+            await AssertSameAnswerAsync(await client.SendAsync(Post("/pay", user)), await client.SendAsync(Post("/handler/SEND_MONEY", user)), user ?? "anonymous");
+        }
         // Once per process, through the SDK's logger.
         Assert.Equal(new[] { (Microsoft.Extensions.Logging.LogLevel.Error, "[Touchque] TQ_API_KEY and TQ_API_SECRET are not set: routes guarded by Touchque answer 500 misconfigured.") },
             logger.Lines);
@@ -236,6 +330,8 @@ public class AspNetCoreTests : IAsyncLifetime
 
         // A controller writes it with MVC's options (PascalCase here), an endpoint with the minimal APIs' ones (camelCase).
         JsonAssert.Equal(new { Message = "Too many rejected approvals. Try again later.", Code = "frozen", touchque = step }, await Body("/payouts"));
+        // So does ToResult in a controller action of your own.
+        JsonAssert.Equal(new { Message = "Too many rejected approvals. Try again later.", Code = "frozen", touchque = step }, await Body("/payouts/handler"));
         JsonAssert.Equal(new { message = "Too many rejected approvals. Try again later.", code = "frozen", touchque = step }, await Body("/shape"));
         // Keys keep their case; only the SDK's "touchque" is left, whatever the spelling of the others.
         var keys = await Body("/keys");
@@ -518,4 +614,8 @@ public sealed class PayoutsController : Microsoft.AspNetCore.Mvc.ControllerBase
     [Microsoft.AspNetCore.Mvc.HttpPost("/payouts")]
     [RequireTouchque("SEND_MONEY")]
     public IResult Create() => Results.Ok(new { via = HttpContext.GetTouchqueApproval()?.ConfirmedVia });
+
+    /// <summary>A guard inside a controller action: ToResult writes the ErrorBody's result with MVC's JSON options.</summary>
+    [Microsoft.AspNetCore.Mvc.HttpPost("/payouts/handler")]
+    public Task<IResult> Handler() => AspNetCoreTests.HandlerAsync(HttpContext, "SEND_MONEY", r => new { Message = r.Message, Code = r.Code });
 }

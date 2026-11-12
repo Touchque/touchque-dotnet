@@ -239,3 +239,23 @@ internal static class Base64Url
         }
     }
 }
+
+/// <summary>
+/// A string field that may come in another shape: a string is read as it is, anything else (a
+/// number, an object, an array) as null, instead of failing the whole answer.
+/// </summary>
+internal sealed class LenientStringConverter : JsonConverter<string?>
+{
+    public override string? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.String) return reader.GetString();
+        reader.Skip();
+        return null;
+    }
+
+    public override void Write(Utf8JsonWriter writer, string? value, JsonSerializerOptions options)
+    {
+        if (value is null) writer.WriteNullValue();
+        else writer.WriteStringValue(value);
+    }
+}

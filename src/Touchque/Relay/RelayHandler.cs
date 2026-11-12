@@ -306,12 +306,13 @@ public sealed class RelayHandler<TRequest>
 
     private static string? NonEmpty(string? s) => string.IsNullOrEmpty(s) ? null : s;
 
+    /// <summary>A step or a refusal, as every adapter sends it (the same answer as <c>RequireTouchque</c>'s without an ErrorBody).</summary>
     private static RelayResponse GuardResponse(GuardResult result)
     {
-        var res = new RelayResponse(result.Status, result.Body);
-        if (result.RetryAfter is { } ra) res.SetHeader("Retry-After", ra.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        foreach (var (name, value) in result.RefusalHeaders) res.SetHeader(name, value);
-        return res.SetHeader("Cache-Control", "no-store");
+        var answer = Guard.Answer(result);
+        var res = new RelayResponse(answer.Status, answer.Body);
+        foreach (var (name, value) in answer.Headers) res.SetHeader(name, value);
+        return res;
     }
 
     // ── Offline Sign ──────────────────────────────────────────────────────

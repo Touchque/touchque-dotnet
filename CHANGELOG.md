@@ -3,6 +3,24 @@
 All notable changes to this project will be documented in this file. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [5.2.0] — Unreleased
+
+### Added
+- **`Guard.RunAsync(null, input)`: the default client.** A null client is `Guard.DefaultClient()`, built from `TQ_API_KEY`, `TQ_API_SECRET` and `TQ_API_URL` on the first request and kept; a build that fails is not kept, so the next request tries again. It is thread-safe. While it cannot be built, the guard answers 401 `unauthenticated` without a user, else 500 `misconfigured`, and never throws; nothing is logged then, since the SDK's logger belongs to a client. `Guard.IsStatusPoll(null, input)` uses the same client and is false while there is none. It reads the environment only, not `AddTouchque`'s options (see the README for resolving that client per request).
+  - `Guard.SetDefaultClient(client)` replaces it process-wide, for example with a client built with a `Logger`, which gives the null-client path its log lines; null forgets it, so the next call builds one from the environment again.
+  - To fail fast at startup, call `Guard.DefaultClient()`: it throws `TouchqueConfigException`, naming the problem.
+- **ASP.NET Core: `r.ToResult(errorBody)` and `await r.WriteAsync(http, errorBody)`: a guard result as its HTTP answer** (`TouchqueGuardResultExtensions`, extension methods on `GuardResult`). For a step or a refusal (an approval throws `ArgumentException`): `Cache-Control: no-store`, `Retry-After` on 423 and 429, `X-Touchque-State` and `X-Touchque-Reason` on a refusal, and the JSON body. `errorBody` follows the `ErrorBody` rules: refusals only (400 or more), written with the app's JSON options (MVC's in a controller action, else the minimal APIs'), an object gets `touchque` set to the step, anything else is sent as it is, a callback that throws or a result that cannot be written sends the default body and logs through `TouchqueOptions.Logger`.
+  - `RequireTouchque`, `[RequireTouchque]` and `MapTouchqueRelay` build their answers with the same code, so a guard inside your handler answers exactly like them.
+- **Waiting polls carry `expiresAt`.** A `waiting` or `passkey_required` step with `expiresAt` puts it in its token as the claim `rx` (ms since the epoch), and every later poll answer for that request in those states carries `expiresAt`, also after a detour through the offline QR. Before, only the first answer had it, so a page reading the latest answer never stopped by time. A poll takes the live expiry from the status answer when it parses (a Vishing Shield escalation to a passkey extends the request to 180 s), else `rx`, and the re-issued token keeps the one used. With neither, no `expiresAt`, as before.
+- `GuardTokenClaims.RequestExpiresAt` (`rx`, Unix milliseconds): `GuardToken.Sign` writes it and `GuardToken.Verify` reads it, so a token you verify and sign again keeps `expiresAt` on its polls.
+- `LoginStatus.ExpiresAt`: the request's live expiry from `GET /login/status` (null when the API did not say, or sent something other than a string, so a poll falls back to `rx`). The step of `CheckAsync(requestId)` carries it.
+
+### Changed
+- **`Enroll = false` says why.** A user with no phone on a guard that may not show a first-time QR (`GuardInput.Enroll`, `TouchqueGuardOptions.Enroll`, `StartOptions.Enroll`, the relay's `/login` without `GetLoginUser`) gets 202 `{"touchque":{"state":"enroll","reason":"enrollment_off"},…}` instead of a bare `enroll` step. `@touchque/web` 2.2.0 stops polling there and shows that no phone is linked yet.
+- `GuardRefusal.From(result)` takes the step from `result.Step` when the body has no `touchque` (a `BeforeStart` hook's result).
+- An API answer that does not fit its type throws `TouchqueNetworkException` ("could not read the answer: …"), as in the Java SDK, instead of `JsonException`, so a guard answers 503 `unavailable` instead of throwing.
+- README, "Guard inside your handler": the client is resolved per request from `HttpContext.RequestServices`, with `Guard.WithoutClient(input)` while it cannot be built (a `TouchqueClient` handler parameter is resolved from DI before your code runs and throws without keys); `Guard.RunAsync(null, …)` for keys in the environment only, which logs nothing (fail fast with `Guard.DefaultClient()` at startup, or give it a logger with `Guard.SetDefaultClient`); the answer from `r.ToResult()`. Also: a new first-time QR comes about 15 s before the old one expires, with new recovery codes, and the old QR and codes stop working; waiting polls carry `expiresAt`; `Enroll = false` answers `enrollment_off`; a 202 state other than `waiting` or `enroll` needs `@touchque/web` or your own UI following the contract. The snippets are compiled with the tests.
+
 ## [5.1.0] — Unreleased
 
 ### Added

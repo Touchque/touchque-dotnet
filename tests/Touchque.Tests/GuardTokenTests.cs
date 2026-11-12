@@ -36,10 +36,15 @@ public class GuardTokenTests
         Assert.Equal(claims, GuardToken.Verify("s", GuardToken.Sign("s", claims)));
         var enroll = new GuardTokenClaims { User = "a", Action = "LOGIN", State = "enroll", EnrollExpiresAt = 4102444800000, ExpiresAt = InAMinute };
         Assert.Equal(enroll, GuardToken.Verify("s", GuardToken.Sign("s", enroll)));
+        // rx: a waiting step's request expiry, so a Verify-then-Sign round trip keeps expiresAt on its polls.
+        var waiting = new GuardTokenClaims { User = "a", Action = "LOGIN", State = "waiting", RequestId = "req_3", RequestExpiresAt = 4102444830000, ExpiresAt = InAMinute };
+        var signed = GuardToken.Sign("s", waiting);
+        Assert.Equal(waiting, GuardToken.Verify("s", signed));
+        Assert.Equal(4102444830000, Touchque.Internal.Json.Long(Steps.VerifyGuardToken("s", signed), "rx"));
         // r is always written, as null when there is no reference; the optional claims are left out.
         var bare = Steps.VerifyGuardToken("s", GuardToken.Sign("s", new GuardTokenClaims { User = "a", Action = "LOGIN", State = "waiting", ExpiresAt = InAMinute }))!;
         Assert.True(bare.ContainsKey("r") && bare["r"] is null);
-        Assert.False(bare.ContainsKey("rid") || bare.ContainsKey("n") || bare.ContainsKey("oc") || bare.ContainsKey("cc") || bare.ContainsKey("ee"));
+        Assert.False(bare.ContainsKey("rid") || bare.ContainsKey("n") || bare.ContainsKey("oc") || bare.ContainsKey("cc") || bare.ContainsKey("ee") || bare.ContainsKey("rx"));
     }
 
     [Fact]
