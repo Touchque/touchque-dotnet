@@ -54,6 +54,7 @@ public sealed record ResetSecretResult : TouchqueObject
     public string Secret { get; init; } = "";
     public string ExternalUsername { get; init; } = "";
     public string? ExpiresAt { get; init; }
+    public long? TtlMs { get; init; }
     public string? QrCodeDataUrl { get; init; }
     public IReadOnlyList<string>? RecoveryCodes { get; init; }
 }

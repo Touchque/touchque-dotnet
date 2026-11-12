@@ -1,8 +1,15 @@
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using Touchque.Internal;
+using HttpJsonOptions = Microsoft.AspNetCore.Http.Json.JsonOptions;
+using MvcJsonOptions = Microsoft.AspNetCore.Mvc.JsonOptions;
 
 namespace Touchque.AspNetCore;
 
@@ -47,6 +54,20 @@ public sealed class TouchqueGuardOptions
 
     /// <summary>False: never show the first-time linking QR.</summary>
     public bool Enroll { get; set; } = true;
+
+    /// <summary>
+    /// Your app's own JSON body for refused answers (status 400 or more: 401, 403, 408, 423,
+    /// 429, 500, 503); never called for a 202 step or on approval. What it returns is written
+    /// with your app's JSON options (MVC's for <c>[RequireTouchque]</c>). When that gives a JSON
+    /// object (an anonymous object, a record, a dictionary, a <c>JsonObject</c>), it is sent with
+    /// <c>touchque</c> set to the step, so <c>@touchque/web</c> still sees the state; no token is
+    /// added. Anything else (a string, a number, an array, null) is sent as it is. Status and
+    /// headers stay the same (<c>Cache-Control: no-store</c>, <c>Retry-After</c>,
+    /// <c>X-Touchque-State</c>, <c>X-Touchque-Reason</c>). When it throws, or returns what the
+    /// serializer cannot write, the default body is sent and <c>[Touchque] errorBody failed:
+    /// &lt;message&gt;</c> is logged. It gets a copy of the step.
+    /// </summary>
+    public Func<GuardRefusal, object?>? ErrorBody { get; set; }
 }
 
 /// <summary>
@@ -70,22 +91,29 @@ public static class RequireTouchqueExtensions
         builder.AddEndpointFilter(async (ctx, next) =>
         {
             var guardContext = new TouchqueGuardContext(ctx.HttpContext, ctx.Arguments.ToList());
-            var result = await TouchqueGuardRunner.RunAsync(guardContext, action, options).ConfigureAwait(false);
+            var result = await TouchqueGuardRunner.RunAsync(guardContext, action, options, mvc: false).ConfigureAwait(false);
             return result is null ? await next(ctx).ConfigureAwait(false) : result;
         });
         return builder;
     }
 }
 
+/// <summary>
+/// The guard for one request. The client is built on the first guarded request and kept (a
+/// singleton); while it cannot be built (no API key or secret) the endpoint answers 500
+/// <c>misconfigured</c> (401 without a signed-in user) and never runs.
+/// </summary>
 internal static class TouchqueGuardRunner
 {
-    /// <summary>Null: approved, run the endpoint. Otherwise the answer to send.</summary>
-    public static async Task<IResult?> RunAsync(TouchqueGuardContext context, string action, TouchqueGuardOptions options)
+    /// <summary>Why guarded endpoints answer 500 is logged once per process.</summary>
+    private static int _noClientLogged;
+
+    /// <summary>Null: approved, run the endpoint. Otherwise the answer to send. <paramref name="mvc"/>: a controller action.</summary>
+    public static async Task<IResult?> RunAsync(TouchqueGuardContext context, string action, TouchqueGuardOptions options, bool mvc)
     {
         var http = context.HttpContext;
-        var client = http.RequestServices.GetRequiredService<TouchqueClient>();
         var req = http.Request;
-        var result = await Guard.RunAsync(client, new GuardInput
+        var input = new GuardInput
         {
             User = options.User is null ? http.User.TouchqueUser() : options.User(context),
             Action = action,
@@ -101,7 +129,9 @@ internal static class TouchqueGuardRunner
             BrowserProof = options.SilentSignIn is null ? null : req.Header(Guard.BrowserHeader),
             SilentSignIn = options.SilentSignIn,
             Context = options.Context?.Invoke(context),
-        }, http.RequestAborted).ConfigureAwait(false);
+        };
+        var client = Client(http);
+        var result = client is null ? Guard.WithoutClient(input) : await Guard.RunAsync(client, input, http.RequestAborted).ConfigureAwait(false);
         if (result.Approved is not null)
         {
             http.Items[TouchqueHttpContextExtensions.ApprovalKey] = result.Approved;
@@ -109,7 +139,69 @@ internal static class TouchqueGuardRunner
         }
         http.Response.Headers.CacheControl = "no-store";
         if (result.RetryAfter is { } ra) http.Response.Headers.RetryAfter = ra.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        foreach (var (name, value) in result.RefusalHeaders) http.Response.Headers[name] = value;
+        return Answer(http, result, options.ErrorBody, client, mvc);
+    }
+
+    /// <summary>The registered client (built once, then kept). Null while it cannot be built for a setup error (logged once).</summary>
+    private static TouchqueClient? Client(HttpContext http)
+    {
+        try
+        {
+            return http.RequestServices.GetRequiredService<TouchqueClient>();
+        }
+        catch (TouchqueConfigException e)
+        {
+            if (Interlocked.Exchange(ref _noClientLogged, 1) == 0)
+            {
+                var o = http.RequestServices.GetService<IOptions<TouchqueOptions>>()?.Value ?? new TouchqueOptions();
+                Log(http, null).Error(o.KeysMissing()
+                    ? "[Touchque] TQ_API_KEY and TQ_API_SECRET are not set: routes guarded by Touchque answer 500 misconfigured."
+                    : "[Touchque] " + e.Message);
+            }
+            return null;
+        }
+    }
+
+    /// <summary>The body to send: the guard's, or for a refusal (400 or more) the ErrorBody's when one is set.</summary>
+    private static IResult Answer(HttpContext http, GuardResult result, Func<GuardRefusal, object?>? errorBody, TouchqueClient? client, bool mvc)
+    {
+        var refusal = errorBody is null ? null : GuardRefusal.From(result);
+        if (refusal is not null)
+        {
+            try
+            {
+                // An object is decided by its JSON encoding with the app's options; what they cannot write falls back below.
+                var value = errorBody!(refusal);
+                var node = value is null ? null : JsonNode.Parse(JsonSerializer.SerializeToUtf8Bytes(value, value.GetType(), SerializerOptions(http, mvc)));
+                if (node is JsonObject o)
+                {
+                    // The SDK's key wins, so @touchque/web still sees the state: no other spelling of it is left.
+                    foreach (var key in o.Select(p => p.Key).Where(k => string.Equals(k, "touchque", StringComparison.OrdinalIgnoreCase)).ToList()) o.Remove(key);
+                    o["touchque"] = result.Body!["touchque"]!.DeepClone();
+                }
+                return node is null ? Results.Text("null", "application/json", Encoding.UTF8, result.Status) : Results.Json(node, statusCode: result.Status);
+            }
+            catch (Exception e)
+            {
+                Log(http, client).Error("[Touchque] errorBody failed: " + e.Message);
+            }
+        }
         return Results.Json(result.Body, statusCode: result.Status);
+    }
+
+    /// <summary>The app's JSON options: MVC's for a controller action, else the minimal APIs' ones.</summary>
+    private static JsonSerializerOptions SerializerOptions(HttpContext http, bool mvc) =>
+        (mvc ? http.RequestServices.GetService<IOptions<MvcJsonOptions>>()?.Value.JsonSerializerOptions : null)
+        ?? http.RequestServices.GetService<IOptions<HttpJsonOptions>>()?.Value.SerializerOptions
+        ?? new JsonSerializerOptions(JsonSerializerDefaults.Web);
+
+    /// <summary>The SDK's logger: the client's, or without one, the one TouchqueOptions.Logger / Debug set.</summary>
+    private static SdkLog Log(HttpContext http, TouchqueClient? client)
+    {
+        if (client is not null) return client.Log;
+        var o = http.RequestServices.GetService<IOptions<TouchqueOptions>>()?.Value;
+        return new SdkLog(o?.Logger, o?.Debug ?? false);
     }
 }
 
@@ -132,7 +224,7 @@ public sealed class RequireTouchqueAttribute : Attribute, IAsyncActionFilter
         var options = context.HttpContext.RequestServices.GetService<Microsoft.Extensions.Options.IOptionsMonitor<TouchqueGuardOptions>>()?.Get(Action)
             ?? new TouchqueGuardOptions();
         var guardContext = new TouchqueGuardContext(context.HttpContext, context.ActionArguments.Values.ToList());
-        var result = await TouchqueGuardRunner.RunAsync(guardContext, Action, options).ConfigureAwait(false);
+        var result = await TouchqueGuardRunner.RunAsync(guardContext, Action, options, mvc: true).ConfigureAwait(false);
         if (result is null)
         {
             await next().ConfigureAwait(false);

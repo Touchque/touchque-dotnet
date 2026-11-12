@@ -246,10 +246,23 @@ public sealed class RelayHandler<TRequest>
         var details = _o.GetDetails?.Invoke(req.Native);
         var input = GuardInputFrom(req, user!, _o.ActionType, details, _o.GetLoginUser is not null, _o.SilentSignIn);
         // Polling an approval already sent is not a new attempt: its own, larger per-IP budget, never the user's push budget.
-        var limited = Guard.IsStatusPoll(_tq, input)
+        var poll = Guard.IsStatusPoll(_tq, input);
+        var limited = poll
             ? await AllowAsync(req, "login-poll", null, PollsPerAttempt, ct).ConfigureAwait(false)
             : await AllowAsync(req, "login", user, 1, ct).ConfigureAwait(false);
         if (limited is not null) return limited;
+        // Unless it starts something after all (a push once the phone is linked, a new first-time QR): that is charged like a fresh attempt.
+        if (poll)
+        {
+            input = input with
+            {
+                BeforeStart = async () =>
+                {
+                    var wait = await WaitAsync(req, "login", user, 1, ct).ConfigureAwait(false);
+                    return wait == 0 ? null : new GuardResult { Status = 429, Body = RateLimited(wait), Step = new Step { State = "rate_limited", RetryAfter = wait } };
+                },
+            };
+        }
         var result = await Guard.RunAsync(_tq, input, ct).ConfigureAwait(false);
         if (result.Approved is null) return GuardResponse(result);
         var approved = result.Approved;
@@ -297,6 +310,7 @@ public sealed class RelayHandler<TRequest>
     {
         var res = new RelayResponse(result.Status, result.Body);
         if (result.RetryAfter is { } ra) res.SetHeader("Retry-After", ra.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        foreach (var (name, value) in result.RefusalHeaders) res.SetHeader(name, value);
         return res.SetHeader("Cache-Control", "no-store");
     }
 
@@ -577,14 +591,21 @@ public sealed class RelayHandler<TRequest>
     /// <summary>Null when allowed; otherwise the 429 to send (this IP or this user is over the limit for the route).</summary>
     private async Task<RelayResponse?> AllowAsync(RelayRequest<TRequest> req, string route, string? user, int ipFactor, CancellationToken ct)
     {
-        if (_limiter is null) return null;
+        var wait = await WaitAsync(req, route, user, ipFactor, ct).ConfigureAwait(false);
+        return wait == 0 ? null : new RelayResponse(429, RateLimited(wait)).SetHeader("Retry-After", wait.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>Counts this request on the route's per-IP and per-user limits: seconds to wait when over one, else 0.</summary>
+    private async Task<int> WaitAsync(RelayRequest<TRequest> req, string route, string? user, int ipFactor, CancellationToken ct)
+    {
+        if (_limiter is null) return 0;
         var ipWait = await _limiter.HitAsync("ip|" + route + "|" + (req.Ip.Length > 0 ? req.Ip : "unknown"), _limiter.PerIp * ipFactor, null, ct).ConfigureAwait(false);
         var userWait = string.IsNullOrEmpty(user) ? 0 : await _limiter.HitAsync("user|" + route + "|" + user, _limiter.PerUser, null, ct).ConfigureAwait(false);
-        var wait = Math.Max(ipWait, userWait);
-        if (wait == 0) return null;
-        return new RelayResponse(429, new JsonObject { ["error"] = "RATE_LIMITED", ["message"] = "Too many attempts. Try again later.", ["retryAfter"] = wait })
-            .SetHeader("Retry-After", wait.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        return Math.Max(ipWait, userWait);
     }
+
+    private static JsonObject RateLimited(int wait) =>
+        new() { ["error"] = "RATE_LIMITED", ["message"] = "Too many attempts. Try again later.", ["retryAfter"] = wait };
 
     private static RelayResponse Unauthorized() => new(401, new JsonObject
     {

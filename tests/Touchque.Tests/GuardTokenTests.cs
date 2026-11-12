@@ -34,10 +34,12 @@ public class GuardTokenTests
             State = "offline", RequestId = "req_2", Number = "17", OfflineChallengeId = "oc_1", CaseCode = "REF-USE", ExpiresAt = InAMinute,
         };
         Assert.Equal(claims, GuardToken.Verify("s", GuardToken.Sign("s", claims)));
+        var enroll = new GuardTokenClaims { User = "a", Action = "LOGIN", State = "enroll", EnrollExpiresAt = 4102444800000, ExpiresAt = InAMinute };
+        Assert.Equal(enroll, GuardToken.Verify("s", GuardToken.Sign("s", enroll)));
         // r is always written, as null when there is no reference; the optional claims are left out.
         var bare = Steps.VerifyGuardToken("s", GuardToken.Sign("s", new GuardTokenClaims { User = "a", Action = "LOGIN", State = "waiting", ExpiresAt = InAMinute }))!;
         Assert.True(bare.ContainsKey("r") && bare["r"] is null);
-        Assert.False(bare.ContainsKey("rid") || bare.ContainsKey("n") || bare.ContainsKey("oc") || bare.ContainsKey("cc"));
+        Assert.False(bare.ContainsKey("rid") || bare.ContainsKey("n") || bare.ContainsKey("oc") || bare.ContainsKey("cc") || bare.ContainsKey("ee"));
     }
 
     [Fact]
@@ -72,5 +74,16 @@ public class GuardTokenTests
         Assert.False(Guard.IsStatusPoll(tq, input with { Details = [("Amount", "9999 EUR")] }));
         Assert.False(Guard.IsStatusPoll(tq, input with { Token = GuardToken.Sign("another_secret", claims) }));
         Assert.False(Guard.IsStatusPoll(tq, input with { Token = GuardToken.Sign("test_secret", claims with { State = "approved" }) }));
+
+        // A first-time QR still up (more than 15 s left, ee) is a poll. The poll that renews an expiring QR,
+        // a replayed token of an expired one and a 5.0 token (no ee) are not: relays count them.
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var enroll = claims with { State = "enroll", RequestId = null, EnrollExpiresAt = now + 60_000 };
+        Assert.True(Guard.IsStatusPoll(tq, input with { Token = GuardToken.Sign("test_secret", enroll) }));
+        Assert.False(Guard.IsStatusPoll(tq, input with { Token = GuardToken.Sign("test_secret", enroll), Offline = true }));
+        Assert.False(Guard.IsStatusPoll(tq, input with { Token = GuardToken.Sign("test_secret", enroll), User = "eve@acme.com" }));
+        Assert.False(Guard.IsStatusPoll(tq, input with { Token = GuardToken.Sign("test_secret", enroll with { EnrollExpiresAt = now + 10_000 }) }));
+        Assert.False(Guard.IsStatusPoll(tq, input with { Token = GuardToken.Sign("test_secret", enroll with { EnrollExpiresAt = now - 1_000 }) }));
+        Assert.False(Guard.IsStatusPoll(tq, input with { Token = GuardToken.Sign("test_secret", enroll with { EnrollExpiresAt = null }) }));
     }
 }

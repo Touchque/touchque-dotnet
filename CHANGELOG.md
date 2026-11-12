@@ -3,7 +3,26 @@
 All notable changes to this project will be documented in this file. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [5.1.0] — Unreleased
+
+### Added
+- **ASP.NET Core: `ErrorBody` keeps your app's error shape.** `TouchqueGuardOptions.ErrorBody` (`Func<GuardRefusal, object?>`, on an endpoint's `RequireTouchque`, or on `[RequireTouchque]` through `Configure` / `ConfigureAll<TouchqueGuardOptions>`) receives every refusal with status 400 or more (401, 403, 408, 423, 429, 500, 503) as a `GuardRefusal`: `Status`, `Code` (`error.code`, else the step's `reason`, else its `state`), `Message` (`error.message`, else a sentence for the state) and `Touchque` (the step). It is never called for a 202 step or on approval.
+  - What it returns is written with the app's JSON options: MVC's for `[RequireTouchque]`, the minimal APIs' for an endpoint. When that gives a JSON object (anonymous, a record, a dictionary, a `JsonObject`), it is sent with `touchque` set to the step and no other spelling of that key (keys keep their case), so `@touchque/web` still sees the state. No `token` is added.
+  - Anything else (a string, a number, an array, null) is sent as it is. The status and headers stay the same (`Cache-Control: no-store`, `Retry-After`, `X-Touchque-State`, `X-Touchque-Reason`). The callback gets a copy of the step.
+  - A callback that throws, or a result the serializer cannot write, logs `[Touchque] errorBody failed: <message>`, and the default body is sent.
+- **Refusal headers.** Every guard answer with status 400 or more, from `RequireTouchque` / `[RequireTouchque]` and from `MapTouchqueRelay`, carries `X-Touchque-State: <state>`, and `X-Touchque-Reason: <reason>` when the step has one. `@touchque/web` 2.1.0 reads the step from them when a body has no `touchque` (an ErrorBody's string, say). A page on another origin must expose them (`Access-Control-Expose-Headers`). `GuardResult.RefusalHeaders`, `Guard.StateHeader` and `Guard.ReasonHeader` give them to a guard of your own.
+- `GuardInput.BeforeStart`: see the first-time linking fix below.
+- `GuardRefusal.From(result)` and `Guard.WithoutClient(input)` (401 without a user, else 500 `misconfigured`), for guards of your own. `GuardTokenClaims.EnrollExpiresAt` (`ee`) and `ResetSecretResult.TtlMs`.
+- README: "Guard inside your handler" (`Guard.RunAsync` after your own checks, how to answer, running the action once, the 202 and first-time QR polls), the `ErrorBody` option and what a missing key answers. The snippets are compiled with the tests.
+
+### Fixed
+- **First-time linking: one QR per enrollment, not one per poll.** In 5.0.0 every poll with an `enroll` token started again (login request, 404 `device_not_linked`, generate-secret 409, reset). Each 1.5 s poll replaced the QR and the recovery codes on screen, so the QR being scanned stopped working. Now:
+  - An `enroll` step with a QR carries `Enroll.ExpiresAt`: the API's `expiresAt` when it is ISO 8601, else now + `ttlMs`, else none. Its token carries that expiry as the claim `ee`.
+  - A poll with that token only reads the link state (`Auth.GetUserAsync`). Not linked and the QR good for more than 15 s: 202 `{"touchque":{"state":"enroll","expiresAt":…},"token":…}` without `enroll`, and the page keeps its QR. Linked: the push starts. Expired or about to, or the user unknown (404): a new QR. Other errors answer 503 `unavailable`.
+  - `Guard.IsStatusPoll` is true for such a poll while the QR has more than 15 s left, so the relay's per-user limit no longer refuses enrollment polls.
+  - Every start is charged. `GuardInput.BeforeStart` (`Func<Task<GuardResult?>>`) is called once, right before such a poll starts anything (a silent check or a push once the phone is linked, a new QR once the old one expired, is about to, or is gone), and a result it returns is answered instead. The relay's `POST /login` charges that start on the user's `login` limit like a fresh attempt and answers its usual 429 when it is over. So polls that only keep the QR are free, and replaying a first-time token can neither start pushes nor renew the secret on the poll budget.
+  - A 5.0 token (no `ee`) works as before. Pages on `@touchque/web` need 2.1.0.
+- **ASP.NET Core: a missing API key no longer throws on a guarded request.** `AddTouchque()` already built the client on first use, so the app started, but a `RequireTouchque` endpoint then threw `TouchqueConfigException`. Now, while the client cannot be built (no `TQ_API_KEY` / `TQ_API_SECRET`), the endpoint never runs: it answers 500 `misconfigured` (401 `unauthenticated` without a signed-in user) with `Cache-Control: no-store`. The SDK logs once through `TouchqueOptions.Logger` (or `Debug`): `[Touchque] TQ_API_KEY and TQ_API_SECRET are not set: routes guarded by Touchque answer 500 misconfigured.` `MapTouchqueRelay` still needs the keys at startup.
 
 ## [5.0.0] — Unreleased
 

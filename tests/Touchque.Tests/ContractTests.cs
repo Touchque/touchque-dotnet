@@ -192,7 +192,7 @@ public class ContractTests : IAsyncLifetime
         Assert.Equal("unavailable", (string)Step(done)["reason"]!);
     }
 
-    private sealed class ListLogger : Microsoft.Extensions.Logging.ILogger
+    internal sealed class ListLogger : Microsoft.Extensions.Logging.ILogger
     {
         public List<(Microsoft.Extensions.Logging.LogLevel Level, string Message)> Lines { get; } = new();
 
@@ -289,6 +289,172 @@ public class ContractTests : IAsyncLifetime
         var ok = await Guard.RunAsync(tq, G("new-offline@acme.com", Token(wrong), code: "ABCD123"));
         Assert.Equal(200, ok.Status);
         Assert.Equal(("offline_code", "OFFLINE_CODE"), (ok.Approved!.Assurance!.Method, ok.Approved.ConfirmedVia));
+    }
+
+    [Fact]
+    public async Task GuardKeepsTheFirstTimeQrWhileItIsUp()
+    {
+        var tq = _api.Client();
+        var first = await Guard.RunAsync(tq, G("qr@acme.com"));
+        var enroll = Step(first)["enroll"]!;
+        Assert.Equal("data:image/png;base64,QR-qr@acme.com", (string)enroll["qrCodeDataUrl"]!);
+        var expiresAt = (string)enroll["expiresAt"]!;
+        var ee = DateTimeOffset.Parse(expiresAt, System.Globalization.CultureInfo.InvariantCulture).ToUnixTimeMilliseconds();
+        Assert.InRange(ee - DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), 270_000, 330_000); // the API's 5 minutes
+        Assert.Equal(ee, GuardToken.Verify("test_secret", Token(first))!.EnrollExpiresAt);
+        Assert.True(Guard.IsStatusPoll(tq, G("qr@acme.com", Token(first))));
+        Assert.False(Guard.IsStatusPoll(tq, G("eve@acme.com", Token(first))));
+
+        // A poll reads the link state only: the page keeps the QR and recovery codes it shows.
+        var before = (await _api.CallsAsync()).Count;
+        var poll = await Guard.RunAsync(tq, G("qr@acme.com", Token(first)));
+        Assert.Equal(202, poll.Status);
+        JsonAssert.Equal(new { state = "enroll", expiresAt }, Step(poll));
+        var calls = await _api.CallsAsync();
+        Assert.Equal(before + 1, calls.Count);
+        Assert.Equal(("GET", "/users/qr%40acme.com"), ((string)calls[before]!["method"]!, (string)calls[before]!["path"]!));
+        var claims = GuardToken.Verify("test_secret", Token(poll))!;
+        Assert.Equal(("enroll", (long?)ee), (claims.State, claims.EnrollExpiresAt));
+        var again = await Guard.RunAsync(tq, G("qr@acme.com", Token(poll)));
+        JsonAssert.Equal(new { state = "enroll", expiresAt }, Step(again));
+
+        // Linked: the push starts.
+        await _api.LinkAsync("qr@acme.com");
+        var waiting = await Guard.RunAsync(tq, G("qr@acme.com", Token(again)));
+        Assert.Equal((202, "waiting"), (waiting.Status, (string)Step(waiting)["state"]!));
+        await _api.ApproveAsync();
+        Assert.Equal(200, (await Guard.RunAsync(tq, G("qr@acme.com", Token(waiting)))).Status);
+    }
+
+    [Fact]
+    public async Task AFirstTimeQrAboutToExpireOrGoneIsReplaced()
+    {
+        var tq = _api.Client();
+        // A QR within 15 s of its expiry is replaced: a new one, with new recovery codes.
+        await _api.OptsAsync(new { secretTtlMs = 10_000 });
+        var first = await Guard.RunAsync(tq, G("short@acme.com"));
+        Assert.Equal("data:image/png;base64,QR-short@acme.com", (string)Step(first)["enroll"]!["qrCodeDataUrl"]!);
+        // The poll that renews it is not a status poll: relays count it against the user's limit.
+        Assert.False(Guard.IsStatusPoll(tq, G("short@acme.com", Token(first))));
+        var next = await Guard.RunAsync(tq, G("short@acme.com", Token(first)));
+        Assert.Equal("data:image/png;base64,QR2-short@acme.com", (string)Step(next)["enroll"]!["qrCodeDataUrl"]!);
+        Assert.Equal("r2", (string)Step(next)["enroll"]!["recoveryCodes"]![0]!);
+        Assert.Equal("/auth/secret/reset", (string)(await _api.LastCallAsync())["path"]!);
+
+        // Touchque no longer knows the user (404): the QR is gone, a new one.
+        await _api.OptsAsync(new { secretTtlMs = 300_000 });
+        var fresh = await Guard.RunAsync(tq, G("gone@acme.com"));
+        await _api.ResetAsync();
+        var renewed = await Guard.RunAsync(tq, G("gone@acme.com", Token(fresh)));
+        Assert.Equal("data:image/png;base64,QR-gone@acme.com", (string)Step(renewed)["enroll"]!["qrCodeDataUrl"]!);
+        Assert.Equal("/auth/generate-secret", (string)(await _api.LastCallAsync())["path"]!);
+
+        // A 5.0 token (no ee): every poll starts again, as before.
+        await Guard.RunAsync(tq, G("old@acme.com"));
+        var old = GuardToken.Sign("test_secret", new GuardTokenClaims
+        {
+            User = "old@acme.com", Action = "LOGIN", State = "enroll", ExpiresAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 60_000,
+        });
+        Assert.False(Guard.IsStatusPoll(tq, G("old@acme.com", old)));
+        var restarted = await Guard.RunAsync(tq, G("old@acme.com", old));
+        Assert.Equal("data:image/png;base64,QR2-old@acme.com", (string)Step(restarted)["enroll"]!["qrCodeDataUrl"]!);
+    }
+
+    [Fact]
+    public async Task BeforeStartRunsOnceBeforeAFirstTimeQrPollStartsAnythingAndItsAnswerWins()
+    {
+        var tq = _api.Client();
+        var calls = 0;
+        var stop = new GuardResult { Status = 429, Body = new JsonObject { ["error"] = "RATE_LIMITED" }, Step = new Step { State = "rate_limited", RetryAfter = 7 } };
+        Func<Task<GuardResult?>> charge = () =>
+        {
+            calls++;
+            return Task.FromResult<GuardResult?>(stop);
+        };
+        // A fresh attempt, and a poll that keeps the QR: nothing to charge.
+        var first = await Guard.RunAsync(tq, G("hook@acme.com") with { BeforeStart = charge });
+        var keep = await Guard.RunAsync(tq, G("hook@acme.com", Token(first)) with { BeforeStart = charge });
+        Assert.Equal(("enroll", 202, 0), ((string)Step(first)["state"]!, keep.Status, calls));
+        // Linked: the push would start; the hook's answer is sent instead and nothing starts.
+        await _api.LinkAsync("hook@acme.com");
+        var before = (await _api.CallsAsync()).Count;
+        Assert.Same(stop, await Guard.RunAsync(tq, G("hook@acme.com", Token(first)) with { BeforeStart = charge }));
+        Assert.Equal((1, before + 1), (calls, (await _api.CallsAsync()).Count)); // the link state only
+        var waiting = await Guard.RunAsync(tq, G("hook@acme.com", Token(first)) with
+        {
+            BeforeStart = () =>
+            {
+                calls++;
+                return Task.FromResult<GuardResult?>(null);
+            },
+        });
+        Assert.Equal(("waiting", 2), ((string)Step(waiting)["state"]!, calls));
+        // A QR in its last 15 s, and a QR Touchque no longer knows (404): called before the new QR.
+        await _api.OptsAsync(new { secretTtlMs = 10_000 });
+        var near = await Guard.RunAsync(tq, G("near@acme.com"));
+        Assert.Same(stop, await Guard.RunAsync(tq, G("near@acme.com", Token(near)) with { BeforeStart = charge }));
+        await _api.ResetAsync();
+        Assert.Same(stop, await Guard.RunAsync(tq, G("near@acme.com", Token(near)) with { BeforeStart = charge }));
+        Assert.Equal(4, calls);
+        Assert.Equal(new[] { "GET" }, (await _api.CallsAsync()).Select(c => (string)c!["method"]!)); // no new secret
+        // A waiting token is not a first-time QR: not called.
+        await _api.LinkAsync("near@acme.com");
+        var push = await Guard.RunAsync(tq, G("near@acme.com"));
+        await Guard.RunAsync(tq, G("near@acme.com", Token(push)) with { BeforeStart = charge });
+        Assert.Equal(4, calls);
+    }
+
+    [Fact]
+    public async Task APollThatWasAStatusPollStillGoesThroughBeforeStartWhenItRenewsTheQr()
+    {
+        var tq = _api.Client();
+        await _api.OptsAsync(new { secretTtlMs = 16_000 }); // 1 s above the 15 s margin
+        var first = await Guard.RunAsync(tq, G("margin@acme.com"));
+        var poll = G("margin@acme.com", Token(first));
+        Assert.True(Guard.IsStatusPoll(tq, poll)); // a relay counts it on the poll budget...
+        await Task.Delay(1_100); // ...and the QR enters its last 15 s before the guard runs
+        var calls = 0;
+        var renewed = await Guard.RunAsync(tq, poll with
+        {
+            BeforeStart = () =>
+            {
+                calls++;
+                return Task.FromResult<GuardResult?>(null);
+            },
+        });
+        Assert.Equal((1, "data:image/png;base64,QR2-margin@acme.com"), (calls, (string)Step(renewed)["enroll"]!["qrCodeDataUrl"]!));
+    }
+
+    [Fact]
+    public async Task TheQrExpiryFallsBackToTtlMsAndALinkStateErrorIs503()
+    {
+        string? expiresAt = "soon";
+        long? ttlMs = 60_000;
+        var http = new HttpClient(new StubHandler((req, _) => req.RequestUri!.AbsolutePath switch
+        {
+            "/login/request" => StubHandler.Json(404, new { code = "device_not_linked", error = "No linked device found for this user" }),
+            "/auth/generate-secret" => StubHandler.Json(200, new { qrCodeDataUrl = "data:image/png;base64,QR", expiresAt, ttlMs, recoveryCodes = new[] { "r1" } }),
+            _ => StubHandler.Json(503, new { error = "unavailable" }),
+        }));
+        var tq = new TouchqueClient(new TouchqueOptions { ApiKey = "tq_x", ApiSecret = "s", BaseUrl = "https://api.example" }, http);
+        // The API's expiresAt is not ISO 8601: now + ttlMs.
+        var first = await Guard.RunAsync(tq, G("ttl@acme.com"));
+        var ee = Steps.EpochMillis((string?)Step(first)["enroll"]!["expiresAt"])!.Value;
+        Assert.InRange(ee - DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), 50_000, 61_000);
+        Assert.Equal(ee, GuardToken.Verify("s", Token(first))!.EnrollExpiresAt);
+        // Reading the link state fails with anything but 404: the guard's usual 503.
+        var poll = await Guard.RunAsync(tq, G("ttl@acme.com", Token(first)));
+        Assert.Equal((503, "unavailable"), (poll.Status, (string)Step(poll)["reason"]!));
+        // Neither: no expiry, and the token carries none.
+        (expiresAt, ttlMs) = (null, null);
+        var noExpiry = await Guard.RunAsync(tq, G("ttl@acme.com"));
+        Assert.Null(Step(noExpiry)["enroll"]!["expiresAt"]);
+        Assert.Null(GuardToken.Verify("s", Token(noExpiry))!.EnrollExpiresAt);
+
+        Assert.Equal(1_700_000_000_000, Steps.EpochMillis("2023-11-14T22:13:20Z"));
+        Assert.Equal(1_700_000_000_000, Steps.EpochMillis("2023-11-15T01:13:20.000+03:00"));
+        Assert.Equal("2023-11-14T22:13:20.000Z", Steps.Iso(1_700_000_000_000));
+        Assert.Null(Steps.EpochMillis("2023-11-14T22:13:20"));
     }
 
     [Fact]

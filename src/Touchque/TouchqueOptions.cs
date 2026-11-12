@@ -36,8 +36,7 @@ public sealed class TouchqueOptions
     /// <summary>The options with the environment filled in, checked.</summary>
     internal ResolvedOptions Resolve()
     {
-        var apiKey = ApiKey ?? Environment.GetEnvironmentVariable("TQ_API_KEY");
-        var apiSecret = ApiSecret ?? Environment.GetEnvironmentVariable("TQ_API_SECRET");
+        var (apiKey, apiSecret) = Keys();
         var baseUrl = BaseUrl ?? Environment.GetEnvironmentVariable("TQ_API_URL");
         if (string.IsNullOrEmpty(baseUrl)) baseUrl = DefaultBaseUrl;
         if (string.IsNullOrEmpty(apiKey) || string.IsNullOrEmpty(apiSecret))
@@ -50,6 +49,17 @@ public sealed class TouchqueOptions
         }
         AssertSafeBaseUrl(baseUrl, "BaseUrl");
         return new ResolvedOptions(apiKey, apiSecret, baseUrl.TrimEnd('/'), Timeout, new Internal.SdkLog(Logger, Debug));
+    }
+
+    /// <summary>The key and secret: these options, else TQ_API_KEY / TQ_API_SECRET.</summary>
+    private (string? ApiKey, string? ApiSecret) Keys() =>
+        (ApiKey ?? Environment.GetEnvironmentVariable("TQ_API_KEY"), ApiSecret ?? Environment.GetEnvironmentVariable("TQ_API_SECRET"));
+
+    /// <summary>No API key or secret here or in the environment: no client can be built.</summary>
+    internal bool KeysMissing()
+    {
+        var (apiKey, apiSecret) = Keys();
+        return string.IsNullOrEmpty(apiKey) || string.IsNullOrEmpty(apiSecret);
     }
 
     /// <summary>Allow plaintext http only for localhost / loopback (local development).</summary>

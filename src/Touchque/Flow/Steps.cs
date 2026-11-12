@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -39,6 +40,7 @@ public sealed record StepEnroll
 {
     public string? QrCodeDataUrl { get; init; }
     public IReadOnlyList<string>? RecoveryCodes { get; init; }
+    /// <summary>When the QR stops working (ISO 8601).</summary>
     public string? ExpiresAt { get; init; }
 }
 
@@ -185,7 +187,7 @@ internal static class Steps
         try
         {
             var gen = await client.Auth.GenerateSecretAsync(user, ct).ConfigureAwait(false);
-            return new Step { State = "enroll", Enroll = new StepEnroll { QrCodeDataUrl = gen.QrCodeDataUrl, RecoveryCodes = gen.RecoveryCodes, ExpiresAt = gen.ExpiresAt } };
+            return new Step { State = "enroll", Enroll = new StepEnroll { QrCodeDataUrl = gen.QrCodeDataUrl, RecoveryCodes = gen.RecoveryCodes, ExpiresAt = QrExpiresAt(gen.ExpiresAt, gen.TtlMs) } };
         }
         catch (TouchqueApiException e) when (e.Status == 409)
         {
@@ -203,9 +205,28 @@ internal static class Steps
                 return new Step { State = "enroll", Reason = "already_linked" };
             }
             var reset = await client.Auth.ResetSecretAsync(user, ct).ConfigureAwait(false);
-            return new Step { State = "enroll", Enroll = new StepEnroll { QrCodeDataUrl = reset.QrCodeDataUrl, RecoveryCodes = reset.RecoveryCodes, ExpiresAt = reset.ExpiresAt } };
+            return new Step { State = "enroll", Enroll = new StepEnroll { QrCodeDataUrl = reset.QrCodeDataUrl, RecoveryCodes = reset.RecoveryCodes, ExpiresAt = QrExpiresAt(reset.ExpiresAt, reset.TtlMs) } };
         }
     }
+
+    /// <summary>When a first-time QR stops working: the API's expiresAt when it is ISO 8601, else now + ttlMs, else unknown.</summary>
+    private static string? QrExpiresAt(string? expiresAt, long? ttlMs)
+    {
+        if (EpochMillis(expiresAt) is not null) return expiresAt;
+        return ttlMs is > 0 ? Iso(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + ttlMs.Value) : null;
+    }
+
+    private static readonly string[] IsoFormats = { "yyyy-MM-dd'T'HH:mm:ss.FFFFFFF'Z'", "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFzzz" };
+
+    /// <summary>An ISO 8601 date-time with an offset (<c>Z</c> or <c>+03:00</c>) in ms since the epoch, or null.</summary>
+    internal static long? EpochMillis(string? iso) =>
+        !string.IsNullOrEmpty(iso) && DateTimeOffset.TryParseExact(iso, IsoFormats, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var at)
+            ? at.ToUnixTimeMilliseconds()
+            : null;
+
+    /// <summary>ms since the epoch as ISO 8601 in UTC with milliseconds, like JavaScript's toISOString.</summary>
+    internal static string Iso(long epochMillis) =>
+        DateTimeOffset.FromUnixTimeMilliseconds(epochMillis).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
 
     public static async Task<Step> CheckAsync(TouchqueClient client, string requestId, CancellationToken ct)
     {

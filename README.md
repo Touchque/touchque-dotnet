@@ -80,7 +80,9 @@ Until the user approves on their phone the endpoint answers
 matching number, or a QR code the first time the user links the app) and sends the same request
 again with header `X-Touchque-Token: <token>`; [`@touchque/web`](https://www.npmjs.com/package/@touchque/web)
 does this loop for you. Once approved the endpoint runs **once**. Refusals answer 403 (rejected,
-blocked), 408 (expired), 423 (frozen) or 429 (rate limited) with `Retry-After`.
+blocked), 408 (expired), 423 (frozen) or 429 (rate limited) with `Retry-After`. Every refusal
+also carries `X-Touchque-State: <state>`, and `X-Touchque-Reason: <reason>` when the step has
+one. A page on another origin must expose them (`Access-Control-Expose-Headers`).
 
 The approving user is the signed-in user's `email` claim, else `sub`, else the name. For your
 login endpoint (nobody is signed in yet) set `o.User = c => …` to whoever just passed your
@@ -89,6 +91,54 @@ password check.
 **The end user's address.** The risk checks (Tor, location, impossible travel) and the location
 shown on the phone use `HttpContext.Connection.RemoteIpAddress`. Behind a load balancer add
 `app.UseForwardedHeaders()` with your proxy as a known proxy, so it is the address your proxy saw.
+
+### Refusals in your app's error shape (`ErrorBody`)
+
+By default, 403, 408, 423 and 429 refusals answer `{"touchque": step, "token": "..."}`, and 401,
+500 and 503 answer `{"touchque": step, "error": {"code": ..., "message": ...}}`. To keep your
+app's own error shape, set `ErrorBody`:
+
+```csharp
+app.MapPost("/transfer", …)
+    .RequireTouchque("SEND_MONEY", o => o.ErrorBody = r => new { message = r.Message, code = r.Code });
+// 403 {"message":"The approval was rejected.","code":"rejected","touchque":{"state":"rejected",...}}
+
+// Controllers: one action with Configure<TouchqueGuardOptions>("PAYOUT", …), every action with
+builder.Services.ConfigureAll<TouchqueGuardOptions>(o => o.ErrorBody = r => new { message = r.Message, code = r.Code });
+```
+
+- It is called for every answer with status 400 or more (401, 403, 408, 423, 429, 500, 503),
+  never for a 202 step or on approval.
+- `r.Status`; `r.Code`: the guard's `error.code`, else the step's `reason`, else its `state`;
+  `r.Message`: the guard's message, else a sentence for the state ("The approval was rejected.",
+  "The approval expired. Try again.", "Too many rejected approvals. Try again later.", "Too many
+  attempts. Try again later.", "The approval was refused."); `r.Touchque`: the step.
+- What it returns is written with your app's JSON options: MVC's (`AddJsonOptions`) for a
+  controller, the minimal APIs' (`ConfigureHttpJsonOptions`) for an endpoint. When that gives a
+  JSON object (an anonymous object, a record, a dictionary, a `JsonObject`), it is sent with
+  `touchque` set to the step, and no other spelling of that key is kept (the SDK's key wins, so
+  `@touchque/web` still sees the state). No `token` is added. Anything else (a string, a number,
+  an array, null) is sent as it is.
+- The status and headers stay the same: JSON, `Cache-Control: no-store`, `Retry-After`,
+  `X-Touchque-State`, `X-Touchque-Reason`. The callback gets a copy of the step.
+- If it throws, or returns what the serializer cannot write, the default body is sent and
+  `[Touchque] errorBody failed: <message>` is logged.
+
+### Without an API key
+
+`AddTouchque()` builds the client on the first guarded request, so the app starts without
+`TQ_API_KEY` / `TQ_API_SECRET`. Until they are set, a guarded endpoint never runs. It answers 401
+`unauthenticated` without a signed-in user, otherwise 500 with `Cache-Control: no-store`:
+
+```json
+{"touchque":{"state":"blocked","reason":"misconfigured"},"error":{"code":"misconfigured","message":"Two-factor approval is not configured correctly."}}
+```
+
+It is a 500 and not a 503 because it is a setup mistake to fix, not an outage to retry.
+`@touchque/web` shows "Approvals are not set up correctly on this site." The SDK logs it once
+through `TouchqueOptions.Logger` (or `Debug`): `[Touchque] TQ_API_KEY and TQ_API_SECRET are not set: routes guarded by Touchque answer 500 misconfigured.`
+`MapTouchqueRelay` still needs the keys when the app starts, and the webhook endpoint when a
+delivery arrives.
 
 ## Action types
 
@@ -117,7 +167,59 @@ var approval = await tq.CompleteAsync(step.RequestId!, new CompleteExpectations
 });   // uses the approval once, and only for this user, action and amount
 ```
 
-`Guard.RunAsync(tq, new GuardInput { … })` is the whole two-phase contract for any framework.
+## Guard inside your handler
+
+`Guard.RunAsync` is the whole two-phase contract of `RequireTouchque` as one call, for any
+framework (minimal APIs, controllers, Azure Functions). Use it when your own checks must come
+first:
+
+```csharp
+app.MapPost("/transfer", async (Transfer t, HttpContext http, TouchqueClient tq) =>
+{
+    var user = http.User.TouchqueUser();
+    // 1. Your own checks first (ownership, balance): a request you refuse anyway never reaches the phone.
+    if (!await accounts.CanSendAsync(user, t.Amount)) return Results.Conflict(new { error = "insufficient_funds" });
+
+    var h = http.Request.Headers;
+    var r = await Guard.RunAsync(tq, new GuardInput
+    {
+        User = user, Action = "SEND_MONEY", Details = [("Amount", t.Amount), ("To", t.To)],
+        Ip = http.TouchqueClientIp(), UserAgent = h.UserAgent,
+        Token = h[Guard.TokenHeader], Offline = h[Guard.OfflineHeader] == "1",
+        Code = h[Guard.CodeHeader], CodeType = h[Guard.CodeTypeHeader],
+    }, http.RequestAborted);
+    if (r.Approved is null)
+    {
+        // 2. A step (202) or a refusal: send r.Status and r.Body as they are.
+        http.Response.Headers.CacheControl = "no-store";
+        if (r.RetryAfter is { } seconds) http.Response.Headers.RetryAfter = seconds.ToString(CultureInfo.InvariantCulture);   // 423, 429
+        foreach (var (name, value) in r.RefusalHeaders) http.Response.Headers[name] = value;   // X-Touchque-State, X-Touchque-Reason
+        return Results.Json(r.Body, statusCode: r.Status);
+    }
+    // 3. Approved: run the action once. The approval is used up.
+    return Results.Ok(await payments.SendAsync(t));
+});
+```
+
+- Run it after your own checks (ownership, balance), with the details the phone shows, built on
+  your server.
+- Not approved: answer `r.Status` with `r.Body` as JSON and `Cache-Control: no-store`. On 423 and
+  429 add `Retry-After: r.RetryAfter`. On a refusal, add `r.RefusalHeaders`.
+- Approved (`r.Approved` is set): run the action once. A replay of the same token is refused.
+- 202 `{"touchque": step, "token": "..."}`: the page shows the step and sends the same request
+  again with `X-Touchque-Token: <token>`, every ~1.5 s (`touchqueFetch` from `@touchque/web` does
+  this). The token is bound to the user, action, details and `ReferenceId`.
+- While the first-time QR is up, polls answer `{state: "enroll", expiresAt}` without `enroll`:
+  keep showing the QR you have. A new QR comes with `enroll.qrCodeDataUrl` when the old one
+  expired. Pages on @touchque/web need 2.1.0.
+- `Guard.IsStatusPoll(tq, input)` is true for a poll that only reads a state (a push on its way,
+  or a first-time QR with more than 15 s left), so your own rate limit can let it through. If it
+  does, charge what such a poll may still start in `BeforeStart = async () => …`: the guard calls
+  it once, right before a first-time QR poll starts a push (the phone got linked) or a new QR, and
+  answers your result instead when you return one. `MapTouchqueRelay` does this, so every start
+  is counted.
+- `GuardRefusal.From(r)` gives a refusal's status, code and message for your own error body. While
+  no client can be built, `Guard.WithoutClient(input)` answers what the guard answers then.
 
 ## Waiting in one call
 
@@ -397,7 +499,7 @@ DI pass your own: `new TouchqueClient(options, httpClient)`.
 
 ## Logging
 
-The SDK writes nothing to the console on its own. To see its own problems (a misconfigured guard, a failed `OnChallenge`, a relay without `GetLoginUser`), set `TouchqueOptions.Logger` to an `ILogger` (`loggerFactory.CreateLogger("Touchque")`), or `Debug = true` for `Console.Error`. Lines carry an error's type and message, never the request.
+The SDK writes nothing to the console on its own. To see its own problems (a misconfigured guard or missing keys behind one, a failed `ErrorBody` or `OnChallenge`, a relay without `GetLoginUser`), set `TouchqueOptions.Logger` to an `ILogger` (`loggerFactory.CreateLogger("Touchque")`), or `Debug = true` for `Console.Error`. Lines carry an error's type and message, never the request.
 
 ## Development
 

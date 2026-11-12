@@ -54,6 +54,8 @@ public class AspNetCoreTests : IAsyncLifetime
         return app;
     }
 
+    private static string? Header(HttpResponseMessage res, string name) => res.Headers.TryGetValues(name, out var v) ? string.Join(",", v) : null;
+
     private static HttpRequestMessage Post(string path, string? user = null, string? token = null, object? body = null)
     {
         var req = new HttpRequestMessage(HttpMethod.Post, path) { Content = JsonContent.Create(body ?? new { }) };
@@ -94,6 +96,160 @@ public class AspNetCoreTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task WithoutKeysTheAppStartsAndAGuardedEndpointAnswers500MisconfiguredAndNeverRuns()
+    {
+        var logger = new ContractTests.ListLogger();
+        var ran = 0;
+        await using var app = await AppAsync(a =>
+        {
+            a.MapPost("/pay", () =>
+            {
+                ran++;
+                return Results.Ok();
+            }).RequireTouchque("SEND_MONEY");
+            a.MapControllers();
+        }, s => s.Configure<TouchqueOptions>(o =>
+        {
+            o.ApiKey = "";
+            o.ApiSecret = "";
+            o.Logger = logger;
+        }));
+        var client = app.GetTestClient();
+        var anonymous = await client.SendAsync(Post("/pay"));
+        Assert.Equal(HttpStatusCode.Unauthorized, anonymous.StatusCode);
+        JsonAssert.Equal(new { touchque = new { state = "blocked", reason = "unauthenticated" }, error = new { code = "unauthenticated", message = "Sign in first." } },
+            await anonymous.Content.ReadFromJsonAsync<JsonObject>());
+        foreach (var path in new[] { "/pay", "/pay", "/payouts" })
+        {
+            var res = await client.SendAsync(Post(path, "ada@acme.com"));
+            Assert.Equal(HttpStatusCode.InternalServerError, res.StatusCode);
+            Assert.Equal("no-store", res.Headers.CacheControl!.ToString());
+            Assert.Equal(("blocked", "misconfigured"), (Header(res, Guard.StateHeader), Header(res, Guard.ReasonHeader)));
+            JsonAssert.Equal(new
+            {
+                touchque = new { state = "blocked", reason = "misconfigured" },
+                error = new { code = "misconfigured", message = "Two-factor approval is not configured correctly." },
+            }, await res.Content.ReadFromJsonAsync<JsonObject>(), path);
+        }
+        Assert.Equal(0, ran);
+        // Once per process, through the SDK's logger.
+        Assert.Equal(new[] { (Microsoft.Extensions.Logging.LogLevel.Error, "[Touchque] TQ_API_KEY and TQ_API_SECRET are not set: routes guarded by Touchque answer 500 misconfigured.") },
+            logger.Lines);
+    }
+
+    [Fact]
+    public async Task ErrorBodyKeepsTheAppsErrorShapeForRefusalsOnly()
+    {
+        await _api.LinkAsync("eb@acme.com");
+        var calls = 0;
+        var fail = false;
+        object? Shape(GuardRefusal r)
+        {
+            calls++;
+            if (fail) throw new InvalidOperationException("the error template is broken");
+            return new { message = r.Message, code = r.Code };
+        }
+        var logger = new ContractTests.ListLogger();
+        await using var app = await AppAsync(a =>
+        {
+            a.MapPost("/account", (HttpContext http) => Results.Ok(new { via = http.GetTouchqueApproval()!.ConfirmedVia }))
+                .RequireTouchque("LOGIN", o => o.ErrorBody = Shape);
+            a.MapPost("/transfer", () => Results.Ok()).RequireTouchque("SEND_MONEY", o => o.ErrorBody = r => "refused: " + r.Code);
+            a.MapPost("/nothing", () => Results.Ok()).RequireTouchque("SEND_MONEY", o => o.ErrorBody = _ => null);
+        }, s => s.Configure<TouchqueOptions>(o => o.Logger = logger));
+        var client = app.GetTestClient();
+
+        // The callback's object with the step under "touchque" (no token): 401 without a signed-in user.
+        var anonymous = await client.SendAsync(Post("/account"));
+        Assert.Equal(HttpStatusCode.Unauthorized, anonymous.StatusCode);
+        Assert.Equal(("no-store", "application/json"), (anonymous.Headers.CacheControl!.ToString(), anonymous.Content.Headers.ContentType!.MediaType));
+        JsonAssert.Equal(new { message = "Sign in first.", code = "unauthenticated", touchque = new { state = "blocked", reason = "unauthenticated" } },
+            await anonymous.Content.ReadFromJsonAsync<JsonObject>());
+        Assert.Equal(("blocked", "unauthenticated"), (Header(anonymous, Guard.StateHeader), Header(anonymous, Guard.ReasonHeader)));
+        Assert.Equal(1, calls);
+
+        // Never for a 202 step or an approval.
+        var waiting = await client.SendAsync(Post("/account", "eb@acme.com"));
+        Assert.Equal(HttpStatusCode.Accepted, waiting.StatusCode);
+        Assert.Null(Header(waiting, Guard.StateHeader));
+        var token = (string)(await waiting.Content.ReadFromJsonAsync<JsonObject>())!["token"]!;
+        await _api.ApproveAsync();
+        var done = await client.SendAsync(Post("/account", "eb@acme.com", token));
+        Assert.Equal(HttpStatusCode.OK, done.StatusCode);
+        Assert.Equal(1, calls);
+
+        // The status and headers stay.
+        await _api.OptsAsync(new { frozen = true });
+        var frozen = await client.SendAsync(Post("/account", "eb@acme.com"));
+        Assert.Equal(((HttpStatusCode)423, "900", "no-store"), (frozen.StatusCode, frozen.Headers.RetryAfter!.ToString(), frozen.Headers.CacheControl!.ToString()));
+        JsonAssert.Equal(new
+        {
+            message = "Too many rejected approvals. Try again later.", code = "frozen",
+            touchque = new { state = "frozen", retryAfter = 900, caseCode = "REF-USE" },
+        }, await frozen.Content.ReadFromJsonAsync<JsonObject>());
+
+        // Anything but an object is sent as it is.
+        var text = await client.SendAsync(Post("/transfer", "eb@acme.com"));
+        Assert.Equal(((HttpStatusCode)423, "\"refused: frozen\"", "900"), (text.StatusCode, await text.Content.ReadAsStringAsync(), text.Headers.RetryAfter!.ToString()));
+        Assert.Equal("application/json", text.Content.Headers.ContentType!.MediaType);
+        // The state is in a header, since this body has no "touchque".
+        Assert.Equal(("frozen", (string?)null), (Header(text, Guard.StateHeader), Header(text, Guard.ReasonHeader)));
+        var nothing = await client.SendAsync(Post("/nothing", "eb@acme.com"));
+        Assert.Equal(((HttpStatusCode)423, "null", "application/json"), (nothing.StatusCode, await nothing.Content.ReadAsStringAsync(), nothing.Content.Headers.ContentType!.MediaType));
+
+        // A callback that throws: the default body, and a log line.
+        fail = true;
+        var fallback = await client.SendAsync(Post("/account", "eb@acme.com"));
+        Assert.Equal((HttpStatusCode)423, fallback.StatusCode);
+        var body = (await fallback.Content.ReadFromJsonAsync<JsonObject>())!;
+        Assert.Equal(("frozen", false, true), ((string)body["touchque"]!["state"]!, body.ContainsKey("message"), body.ContainsKey("token")));
+        Assert.Contains((Microsoft.Extensions.Logging.LogLevel.Error, "[Touchque] errorBody failed: the error template is broken"), logger.Lines);
+    }
+
+    [Fact]
+    public async Task ErrorBodyIsDecidedByItsJsonEncodingWithTheAppsOptions()
+    {
+        await _api.LinkAsync("enc@acme.com");
+        await _api.OptsAsync(new { frozen = true });
+        var logger = new ContractTests.ListLogger();
+        object? Shape(GuardRefusal r) => new { Message = r.Message, Code = r.Code };
+        await using var app = await AppAsync(a =>
+        {
+            a.MapControllers();
+            a.MapPost("/shape", () => Results.Ok()).RequireTouchque("SEND_MONEY", o => o.ErrorBody = Shape);
+            a.MapPost("/keys", () => Results.Ok()).RequireTouchque("SEND_MONEY", o => o.ErrorBody = r => new Dictionary<string, object?>
+            {
+                ["Touchque"] = "mine", ["TOUCHQUE"] = 1, ["a"] = 1, ["A"] = 2, ["code"] = r.Code,
+            });
+            a.MapPost("/element", () => Results.Ok()).RequireTouchque("SEND_MONEY", o => o.ErrorBody = _ => System.Text.Json.JsonDocument.Parse("{\"a\":1}").RootElement);
+            a.MapPost("/type", () => Results.Ok()).RequireTouchque("SEND_MONEY", o => o.ErrorBody = _ => typeof(string));
+        }, s =>
+        {
+            s.AddControllers().AddJsonOptions(o => o.JsonSerializerOptions.PropertyNamingPolicy = null);
+            s.ConfigureAll<TouchqueGuardOptions>(o => o.ErrorBody = Shape);
+            s.Configure<TouchqueOptions>(o => o.Logger = logger);
+        });
+        var client = app.GetTestClient();
+        // Read case-sensitively: "a" and "A" are two keys.
+        async Task<JsonObject> Body(string path) => (JsonObject)JsonNode.Parse(await (await client.SendAsync(Post(path, "enc@acme.com"))).Content.ReadAsStringAsync())!;
+        var step = new { state = "frozen", retryAfter = 900, caseCode = "REF-USE" };
+
+        // A controller writes it with MVC's options (PascalCase here), an endpoint with the minimal APIs' ones (camelCase).
+        JsonAssert.Equal(new { Message = "Too many rejected approvals. Try again later.", Code = "frozen", touchque = step }, await Body("/payouts"));
+        JsonAssert.Equal(new { message = "Too many rejected approvals. Try again later.", code = "frozen", touchque = step }, await Body("/shape"));
+        // Keys keep their case; only the SDK's "touchque" is left, whatever the spelling of the others.
+        var keys = await Body("/keys");
+        Assert.Equal(new[] { "A", "a", "code", "touchque" }, keys.Select(p => p.Key).OrderBy(k => k, StringComparer.Ordinal));
+        JsonAssert.Equal(step, keys["touchque"]);
+        // A JsonElement that encodes to an object is an object.
+        JsonAssert.Equal(new { a = 1, touchque = step }, await Body("/element"));
+        // What the serializer cannot write: the default body, and a log line.
+        var unwritable = await Body("/type");
+        Assert.Equal(("frozen", true), ((string)unwritable["touchque"]!["state"]!, unwritable.ContainsKey("token")));
+        Assert.Contains(logger.Lines, l => l.Message.StartsWith("[Touchque] errorBody failed: ", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task RequireTouchqueOnAController()
     {
         await _api.LinkAsync("bo@acme.com");
@@ -102,6 +258,7 @@ public class AspNetCoreTests : IAsyncLifetime
         var res = await app.GetTestClient().SendAsync(Post("/payouts", "bo@acme.com"));
         Assert.Equal((HttpStatusCode)423, res.StatusCode);
         Assert.Equal("900", res.Headers.RetryAfter!.ToString());
+        Assert.Equal("frozen", Header(res, Guard.StateHeader));
         await _api.OptsAsync(new { frozen = false });
         var waiting = await app.GetTestClient().SendAsync(Post("/payouts", "bo@acme.com"));
         Assert.Equal(HttpStatusCode.Accepted, waiting.StatusCode);

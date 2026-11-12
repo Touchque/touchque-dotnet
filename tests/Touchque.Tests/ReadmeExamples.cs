@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Claims;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
@@ -126,5 +127,51 @@ internal static class ReadmeExamples
         return purpose == "approve"
             ? SafeApproval.WithApprovals(ownerSignatures, [approval])
             : SafeApproval.ScheduleCall(safe, check.GovernanceHash, [approval]);
+    }
+
+    private sealed class Accounts
+    {
+        public Task<bool> CanSendAsync(string? user, string amount) => Task.FromResult(user is not null && amount.Length > 0);
+    }
+
+    private sealed class Payments
+    {
+        public Task<Transfer> SendAsync(Transfer t) => Task.FromResult(t);
+    }
+
+    /// <summary>"Refusals in your app's error shape" and "Guard inside your handler".</summary>
+    public static void GuardExamples(WebApplicationBuilder builder, WebApplication app)
+    {
+        var accounts = new Accounts();
+        var payments = new Payments();
+        app.MapPost("/transfer", (Transfer t) => Results.Ok())
+            .RequireTouchque("SEND_MONEY", o => o.ErrorBody = r => new { message = r.Message, code = r.Code });
+        builder.Services.ConfigureAll<TouchqueGuardOptions>(o => o.ErrorBody = r => new { message = r.Message, code = r.Code });
+
+        app.MapPost("/transfer", async (Transfer t, HttpContext http, TouchqueClient tq) =>
+        {
+            var user = http.User.TouchqueUser();
+            // 1. Your own checks first (ownership, balance): a request you refuse anyway never reaches the phone.
+            if (!await accounts.CanSendAsync(user, t.Amount)) return Results.Conflict(new { error = "insufficient_funds" });
+
+            var h = http.Request.Headers;
+            var r = await Guard.RunAsync(tq, new GuardInput
+            {
+                User = user, Action = "SEND_MONEY", Details = [("Amount", t.Amount), ("To", t.To)],
+                Ip = http.TouchqueClientIp(), UserAgent = h.UserAgent,
+                Token = h[Guard.TokenHeader], Offline = h[Guard.OfflineHeader] == "1",
+                Code = h[Guard.CodeHeader], CodeType = h[Guard.CodeTypeHeader],
+            }, http.RequestAborted);
+            if (r.Approved is null)
+            {
+                // 2. A step (202) or a refusal: send r.Status and r.Body as they are.
+                http.Response.Headers.CacheControl = "no-store";
+                if (r.RetryAfter is { } seconds) http.Response.Headers.RetryAfter = seconds.ToString(CultureInfo.InvariantCulture);   // 423, 429
+                foreach (var (name, value) in r.RefusalHeaders) http.Response.Headers[name] = value;   // X-Touchque-State, X-Touchque-Reason
+                return Results.Json(r.Body, statusCode: r.Status);
+            }
+            // 3. Approved: run the action once. The approval is used up.
+            return Results.Ok(await payments.SendAsync(t));
+        });
     }
 }
