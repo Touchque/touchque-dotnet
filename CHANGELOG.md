@@ -3,7 +3,10 @@
 All notable changes to this project will be documented in this file. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [5.2.0] — Unreleased
+## [5.2.0] — 2026-11-13
+
+The first release on NuGet since 4.2.0, as `Touchque` and `Touchque.AspNetCore`. NuGet package IDs are case-insensitive, so these are the same packages as 4.2.0's `TouchQue` IDs: from 5.2.0 on, nuget.org shows the new spelling, and 4.2.0 keeps the old one. 5.0.0 and 5.1.0 were not pushed to NuGet; their changes ship in this release.
+
 
 ### Added
 - **`Guard.RunAsync(null, input)`: the default client.** A null client is `Guard.DefaultClient()`, built from `TQ_API_KEY`, `TQ_API_SECRET` and `TQ_API_URL` on the first request and kept; a build that fails is not kept, so the next request tries again. It is thread-safe. While it cannot be built, the guard answers 401 `unauthenticated` without a user, else 500 `misconfigured`, and never throws; nothing is logged then, since the SDK's logger belongs to a client. `Guard.IsStatusPoll(null, input)` uses the same client and is false while there is none. It reads the environment only, not `AddTouchque`'s options (see the README for resolving that client per request).
@@ -21,7 +24,7 @@ format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - An API answer that does not fit its type throws `TouchqueNetworkException` ("could not read the answer: …"), as in the Java SDK, instead of `JsonException`, so a guard answers 503 `unavailable` instead of throwing.
 - README, "Guard inside your handler": the client is resolved per request from `HttpContext.RequestServices`, with `Guard.WithoutClient(input)` while it cannot be built (a `TouchqueClient` handler parameter is resolved from DI before your code runs and throws without keys); `Guard.RunAsync(null, …)` for keys in the environment only, which logs nothing (fail fast with `Guard.DefaultClient()` at startup, or give it a logger with `Guard.SetDefaultClient`); the answer from `r.ToResult()`. Also: a new first-time QR comes about 15 s before the old one expires, with new recovery codes, and the old QR and codes stop working; waiting polls carry `expiresAt`; `Enroll = false` answers `enrollment_off`; a 202 state other than `waiting` or `enroll` needs `@touchque/web` or your own UI following the contract. The snippets are compiled with the tests.
 
-## [5.1.0] — Unreleased
+## [5.1.0] — not published on NuGet (these changes ship in 5.2.0)
 
 ### Added
 - **ASP.NET Core: `ErrorBody` keeps your app's error shape.** `TouchqueGuardOptions.ErrorBody` (`Func<GuardRefusal, object?>`, on an endpoint's `RequireTouchque`, or on `[RequireTouchque]` through `Configure` / `ConfigureAll<TouchqueGuardOptions>`) receives every refusal with status 400 or more (401, 403, 408, 423, 429, 500, 503) as a `GuardRefusal`: `Status`, `Code` (`error.code`, else the step's `reason`, else its `state`), `Message` (`error.message`, else a sentence for the state) and `Touchque` (the step). It is never called for a 202 step or on approval.
@@ -42,7 +45,7 @@ format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - A 5.0 token (no `ee`) works as before. Pages on `@touchque/web` need 2.1.0.
 - **ASP.NET Core: a missing API key no longer throws on a guarded request.** `AddTouchque()` already built the client on first use, so the app started, but a `RequireTouchque` endpoint then threw `TouchqueConfigException`. Now, while the client cannot be built (no `TQ_API_KEY` / `TQ_API_SECRET`), the endpoint never runs: it answers 500 `misconfigured` (401 `unauthenticated` without a signed-in user) with `Cache-Control: no-store`. The SDK logs once through `TouchqueOptions.Logger` (or `Debug`): `[Touchque] TQ_API_KEY and TQ_API_SECRET are not set: routes guarded by Touchque answer 500 misconfigured.` `MapTouchqueRelay` still needs the keys at startup.
 
-## [5.0.0] — Unreleased
+## [5.0.0] — not published on NuGet (these changes ship in 5.2.0)
 
 ### Breaking
 - **Every name is spelled Touchque instead of TouchQue.** Code that uses the old names must be updated; nothing else changes (the NuGet package IDs `Touchque` and `Touchque.AspNetCore`, the API calls, JSON, signatures and behaviour stay as they were).

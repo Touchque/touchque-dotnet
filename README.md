@@ -19,10 +19,6 @@ dotnet add package Touchque.AspNetCore   # ASP.NET Core (brings Touchque)
 dotnet add package Touchque              # anything else: workers, consoles, Azure Functions
 ```
 
-> **Not on NuGet yet.** Until it is, clone [this repository](https://github.com/Touchque/touchque-dotnet) and add
-> `src/Touchque/Touchque.csproj` and `src/Touchque.AspNetCore/Touchque.AspNetCore.csproj` to your solution where they
-> are (`dotnet sln add …`): they take net8.0 and their compiler settings from the repository's `Directory.Build.props`.
-
 The packages, assemblies and namespaces are `Touchque` and `Touchque.AspNetCore` (`using Touchque;`, `using Touchque.AspNetCore;`). Coming from 4.x, where the namespaces were spelled with a capital Q: see the 5.0.0 entry in the [CHANGELOG](CHANGELOG.md).
 
 ## Setup
