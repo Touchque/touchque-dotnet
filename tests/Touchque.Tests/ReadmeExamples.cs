@@ -88,6 +88,20 @@ internal static class ReadmeExamples
 
         await AgentCard.VerifyAsync(cardJson, new() { CardUrl = "https://agent.example/.well-known/agent-card.json" });
 
+        // The prose: what the two calls throw.
+        try
+        {
+            await CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = "https://auth.files.example/token", ClientId = "acme", Assertion = jag.Assertion });
+        }
+        catch (TouchqueIdJagException e) when (e.Error == "temporarily_unavailable" && e.Status is null)
+        {
+            _ = e.InnerException;
+        }
+        catch (OperationCanceledException)
+        {
+            // Only for a cancellation you asked for.
+        }
+
         // DPoP (optional, RFC 9449).
         using var dpopKey = CrossAppAccess.CreateIdJagDpopKey();
         var bound = await CrossAppAccess.RequestIdJagAsync(new() { Issuer = "https://sso.touchque.com", ClientId = clientId,
@@ -101,7 +115,7 @@ internal static class ReadmeExamples
         call.Headers.Authorization = new AuthenticationHeaderValue("DPoP", accessToken);
         call.Headers.Add("DPoP", CrossAppAccess.IdJagDpopProof(dpopKey, call.RequestUri!.AbsoluteUri, call.Method.Method, accessToken));
 
-        // Your authorization server, once the request's DPoP proof checks out (proofJwk: the jwk in its header):
+        // Your authorization server, once the request's DPoP proof and the nonce you require, if any, check out (proofJwk: the jwk in its header):
         var boundClaims = await verifier.VerifyAsync(form["assertion"]!, authenticatedClientId, AgentKeys.Thumbprint(proofJwk));   // boundClaims.CnfJkt
 
         // The prose: the error's nonce, a proof that carries one, and the parts of a resource call's proof.

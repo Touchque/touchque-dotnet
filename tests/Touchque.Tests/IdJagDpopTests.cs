@@ -77,18 +77,24 @@ public class IdJagDpopTests
         {
             Assert.Throws<TouchqueConfigException>(() => CrossAppAccess.IdJagDpopProof(key, url));
         }
+
+        // An empty access token or nonce is left out, like a null one: no ath, no "nonce": "".
+        var empty = Parse(CrossAppAccess.IdJagDpopProof(key, "https://api.example.com/v1/files", "GET", "", "")).Claims;
+        Assert.Equal(new[] { "htm", "htu", "iat", "jti" }, empty.Select(p => p.Key).OrderBy(k => k, StringComparer.Ordinal));
     }
 
-    /// <summary>htm: the method trimmed and uppercased, POST when empty.</summary>
+    /// <summary>htm: the method trimmed of ASCII whitespace (space, tab, CR, LF, VT, FF), POST when empty, uppercased.</summary>
     [Theory]
     [InlineData("GET", "GET")]
     [InlineData("get", "GET")]
     [InlineData(" patch\t", "PATCH")]
     [InlineData("\r\nDelete\n", "DELETE")]
+    [InlineData("\u000Bput\u000C", "PUT")]
     [InlineData("m-search", "M-SEARCH")]
     [InlineData("!#$%&'*+-.^_`|~09az", "!#$%&'*+-.^_`|~09AZ")]
     [InlineData("", "POST")]
     [InlineData("   ", "POST")]
+    [InlineData(" \t\r\n\u000B\u000C", "POST")]
     [InlineData(null, "POST")]
     public void HtmIsTheMethodTrimmedAndUppercased(string? method, string htm)
     {
@@ -96,7 +102,11 @@ public class IdJagDpopTests
         Assert.Equal(htm, Json.Str(Parse(CrossAppAccess.IdJagDpopProof(key, "https://example.com/t", method!)).Claims, "htm"));
     }
 
-    /// <summary>A method is an RFC 9110 token: anything else is a setup mistake (also "poſt", which ToUpperInvariant makes POST).</summary>
+    /// <summary>
+    /// A method is an RFC 9110 token: anything else is a setup mistake (also "poſt", which ToUpperInvariant makes
+    /// POST). Only ASCII whitespace is trimmed: NUL and Unicode whitespace (string.Trim() takes U+0085, U+00A0,
+    /// U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F and U+3000) stay, and are not token characters.
+    /// </summary>
     [Theory]
     [InlineData("GE T")]
     [InlineData("GET,POST")]
@@ -106,11 +116,26 @@ public class IdJagDpopTests
     [InlineData("GET/1")]
     [InlineData("GET\\")]
     [InlineData("GET\u0000")]
+    [InlineData("\u0000GET")]
+    [InlineData("\u001FGET")]
     [InlineData("G\u007FET")]
     [InlineData("GÉT")]
     [InlineData("gıt")]
     [InlineData("poſt")]
     [InlineData("GET\U0001F600")]
+    [InlineData("\u00A0GET")]
+    [InlineData("GET\u00A0")]
+    [InlineData("\u00A0")]
+    [InlineData("\u0085GET")]
+    [InlineData("\u1680GET")]
+    [InlineData("\u2000GET")]
+    [InlineData("GET\u200A")]
+    [InlineData("\u2028GET")]
+    [InlineData("GET\u2029")]
+    [InlineData("\u202FGET")]
+    [InlineData("\u205FGET")]
+    [InlineData("\u3000GET")]
+    [InlineData("\uFEFFGET")]
     public void AMethodThatIsNotATokenIsASetupMistake(string method)
     {
         using var key = CrossAppAccess.CreateIdJagDpopKey();
@@ -330,14 +355,16 @@ public class IdJagDpopTests
         Assert.Equal("n1", Json.Str(server.Requests[1].Proof, "nonce"));
         Assert.Equal(server.Requests[0].Body, server.Requests[1].Body);
 
-        // Not a nonce request: another error, no DPoP-Nonce header, another status. One request each.
+        // Not a nonce request: another error, no DPoP-Nonce header, another status. One request each. The error is
+        // the body's, never the DPoP challenge's.
         foreach (var (answer, error, nonce) in new[]
         {
             (new Answer(400, "{\"error\":\"invalid_grant\"}", ("DPoP-Nonce", "n1")), "invalid_grant", "n1"),
             (new Answer(400, UseDpopNonce), "use_dpop_nonce", null),
             (new Answer(403, UseDpopNonce, ("DPoP-Nonce", "n1")), "use_dpop_nonce", "n1"),
             (new Answer(500, null, ("DPoP-Nonce", "n1")), "server_error", "n1"),
-            (new Answer(401, null, ("WWW-Authenticate", "DPoP error=\"invalid_dpop_proof\""), ("DPoP-Nonce", "n1")), "invalid_dpop_proof", "n1"),
+            (new Answer(401, null, ("WWW-Authenticate", "DPoP error=\"invalid_dpop_proof\""), ("DPoP-Nonce", "n1")), "server_error", "n1"),
+            (new Answer(401, "{\"error\":\"invalid_client\"}", ("WWW-Authenticate", "DPoP error=\"invalid_dpop_proof\""), ("DPoP-Nonce", "n1")), "invalid_client", "n1"),
             (new Answer(401, null, ("WWW-Authenticate", "Bearer error=\"use_dpop_nonce\""), ("DPoP-Nonce", "n1")), "server_error", "n1"),
         })
         {
@@ -381,9 +408,19 @@ public class IdJagDpopTests
     /// A token endpoint on 127.0.0.1 that writes its answers byte for byte (Kestrel refuses control and
     /// non-ASCII characters in a header value): one request per connection, answered by <see cref="Reply"/>.
     /// </summary>
-    private sealed class RawEndpoint : IDisposable
+    internal sealed class RawEndpoint : IDisposable
     {
+        /// <summary>A reply that closes the connection without an answer.</summary>
+        public const string Close = "\0close";
+
+        /// <summary>A reply that resets the connection (TCP RST) without an answer.</summary>
+        public const string Reset = "\0reset";
+
+        /// <summary>A reply that never comes: the connection stays open and silent until the endpoint is disposed.</summary>
+        public const string Hang = "\0hang";
+
         private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
+        private readonly CancellationTokenSource _stop = new();
         private readonly List<string?> _proofs = new();
 
         public RawEndpoint()
@@ -395,7 +432,17 @@ public class IdJagDpopTests
 
         public string Url { get; }
 
-        /// <summary>The answer to the n-th request (from 1): raw HTTP/1.1, sent as Latin-1.</summary>
+        /// <summary>A token endpoint URL on 127.0.0.1 where nothing listens: the connection is refused.</summary>
+        public static string RefusedUrl()
+        {
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            listener.Stop();
+            return $"http://127.0.0.1:{port}/token";
+        }
+
+        /// <summary>The answer to the n-th request (from 1): raw HTTP/1.1, sent as Latin-1, or <see cref="Close"/>, <see cref="Reset"/> or <see cref="Hang"/>.</summary>
         public Func<int, string> Reply { get; set; } = _ => Answer(200, "{}");
 
         /// <summary>The DPoP header of each request so far.</summary>
@@ -461,9 +508,28 @@ public class IdJagDpopTests
                 _proofs.Add(lines.FirstOrDefault(l => l.StartsWith("DPoP:", StringComparison.OrdinalIgnoreCase))?[5..].Trim());
                 count = _proofs.Count;
             }
+            var reply = Reply(count);
+            switch (reply)
+            {
+                case Close:
+                    return;
+                case Reset:
+                    client.Client.LingerState = new LingerOption(true, 0);
+                    return;
+                case Hang:
+                    try
+                    {
+                        await Task.Delay(Timeout.Infinite, _stop.Token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Disposed.
+                    }
+                    return;
+            }
             try
             {
-                await stream.WriteAsync(Encoding.Latin1.GetBytes(Reply(count)));
+                await stream.WriteAsync(Encoding.Latin1.GetBytes(reply));
             }
             catch (IOException)
             {
@@ -471,11 +537,15 @@ public class IdJagDpopTests
             }
         }
 
-        public void Dispose() => _listener.Stop();
+        public void Dispose()
+        {
+            _stop.Cancel();
+            _listener.Stop();
+        }
     }
 
-    private const string NonceAsked = "{\"error\":\"use_dpop_nonce\"}";
-    private const string Tokens = "{\"access_token\":\"at\",\"token_type\":\"DPoP\"}";
+    internal const string NonceAsked = "{\"error\":\"use_dpop_nonce\"}";
+    internal const string Tokens = "{\"access_token\":\"at\",\"token_type\":\"DPoP\"}";
     private const string EveryNqchar = "!#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 
     /// <summary>RFC 9449: nonce = 1*NQCHAR, NQCHAR = %x21 / %x23-5B / %x5D-7E; a header that repeats must repeat the same value.</summary>
@@ -504,7 +574,8 @@ public class IdJagDpopTests
         Task<JsonObject> Redeem(IdJagDpopKey? dpopKey) => CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = server.Url, ClientId = "acme", Assertion = "jag", DpopKey = dpopKey });
 
         // Missing, empty, two values, or not 1*NQCHAR (also a control, DEL, NUL, Latin-1, a bare CR, a folded line):
-        // the usual error, one request, and no DpopNonce. Never another exception type.
+        // the usual error, one request, and no DpopNonce. Never another exception type. (A 401 that asks in its
+        // DPoP challenge only: server_error, since the error comes from the body.)
         foreach (var headers in new[]
         {
             Array.Empty<string>(), new[] { "DPoP-Nonce: " }, new[] { "DPoP-Nonce: n1", "DPoP-Nonce: n2" }, new[] { "DPoP-Nonce: ", "DPoP-Nonce: n1" },
@@ -513,14 +584,18 @@ public class IdJagDpopTests
             new[] { "DPoP-Nonce: a\rb" }, new[] { "DPoP-Nonce: a\r\n b" },
         })
         {
-            foreach (var answer in new[] { RawEndpoint.Answer(400, NonceAsked, headers), RawEndpoint.Answer(401, "", headers.Append("WWW-Authenticate: DPoP error=\"use_dpop_nonce\"").ToArray()) })
+            foreach (var (answer, error) in new[]
+            {
+                (RawEndpoint.Answer(400, NonceAsked, headers), "use_dpop_nonce"),
+                (RawEndpoint.Answer(401, "", headers.Append("WWW-Authenticate: DPoP error=\"use_dpop_nonce\"").ToArray()), "server_error"),
+            })
             {
                 foreach (var dpopKey in new[] { key, null })
                 {
                     server.Clear();
                     server.Reply = n => n == 1 ? answer : RawEndpoint.Answer(200, Tokens);
                     var e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => Redeem(dpopKey));
-                    Assert.Equal(("use_dpop_nonce", (string?)null), (e.Error, e.DpopNonce));
+                    Assert.Equal((error, (string?)null), (e.Error, e.DpopNonce));
                     Assert.Single(server.Proofs);
                 }
             }
@@ -551,7 +626,7 @@ public class IdJagDpopTests
         {
             (RawEndpoint.Answer(400, NonceAsked, "DPoP-Nonce: n2"), "use_dpop_nonce", "n2"),
             (RawEndpoint.Answer(400, "{\"error\":\"invalid_grant\"}"), "invalid_grant", "n1"),
-            (RawEndpoint.Answer(401, "", "WWW-Authenticate: DPoP error=\"invalid_dpop_proof\"", "DPoP-Nonce: not valid"), "invalid_dpop_proof", "n1"),
+            (RawEndpoint.Answer(401, "", "WWW-Authenticate: DPoP error=\"invalid_dpop_proof\"", "DPoP-Nonce: not valid"), "server_error", "n1"),
             (RawEndpoint.Answer(500, "oops", "DPoP-Nonce: n2", "DPoP-Nonce: n3"), "server_error", "n1"),
         })
         {
@@ -563,30 +638,70 @@ public class IdJagDpopTests
         }
     }
 
-    /// <summary>The challenge's error param of a DPoP challenge only (RFC 9110 section 11.6.1); quoted strings are values, never params.</summary>
+    /// <summary>
+    /// A DPoP challenge asks for a nonce when its own error param is exactly use_dpop_nonce (RFC 9110 section
+    /// 11.6.1): quoted strings are values, never params, a quoted-pair is its character, and a quoted string
+    /// without its closing quote has no value. Scheme and param names are case-insensitive, the value is not.
+    /// </summary>
     [Theory]
-    [InlineData("DPoP error=\"use_dpop_nonce\"", "use_dpop_nonce")]
-    [InlineData("DPoP error=use_dpop_nonce", "use_dpop_nonce")]
-    [InlineData("dpop ERROR = \"use_dpop_nonce\"", "use_dpop_nonce")]
-    [InlineData("DPoP algs=\"ES256 PS256\", error=\"invalid_token\"", "invalid_token")]
-    [InlineData("DPoP error_description=\"x, error=use_dpop_nonce\", error=\"invalid_token\"", "invalid_token")]
-    [InlineData("DPoP error_description=\"say \\\"error=use_dpop_nonce\\\"\", error=\"invalid_dpop_proof\"", "invalid_dpop_proof")]
-    [InlineData("DPoP error=\"a\\\"b\"", "a\"b")]
-    [InlineData("Bearer error=\"use_dpop_nonce\"", null)]
-    [InlineData("Bearer error=\"invalid_token\", DPoP error=\"use_dpop_nonce\"", "use_dpop_nonce")]
-    [InlineData("DPoP realm=\"x\", Bearer error=\"use_dpop_nonce\"", null)]
-    [InlineData("Basic realm=\"x\", DPoP algs=\"ES256\", error=\"use_dpop_nonce\"", "use_dpop_nonce")]
-    [InlineData("DPoP error=\"\"", null)]
-    [InlineData("DPoP error=", null)]
-    [InlineData("DPoP error=\"\", error=\"invalid_token\"", "invalid_token")]
-    [InlineData("DPoP", null)]
-    [InlineData("", null)]
-    [InlineData("DPoP error=\"unterminated", "unterminated")]
-    public void TheChallengeErrorIsTheErrorParamOfADpopChallenge(string header, string? error)
+    [InlineData("DPoP error=\"use_dpop_nonce\"", true)]
+    [InlineData("DPoP error=use_dpop_nonce", true)]
+    [InlineData("dpop ERROR = \"use_dpop_nonce\"", true)]
+    [InlineData("DPoP error=\"use\\_dpop\\_nonce\"", true)]
+    [InlineData("DPoP algs=\"ES256 PS256\", error=\"use_dpop_nonce\", error_description=\"a, b\"", true)]
+    [InlineData("DPoP algs=\"ES256 PS256\", error=\"invalid_token\"", false)]
+    [InlineData("DPoP error=\"USE_DPOP_NONCE\"", false)]
+    [InlineData("DPoP error=\"use_dpop_nonce \"", false)]
+    [InlineData("DPoP error_description=\"x, error=use_dpop_nonce\", error=\"invalid_token\"", false)]
+    [InlineData("DPoP error_description=\"say \\\"error=use_dpop_nonce\\\"\", error=\"invalid_dpop_proof\"", false)]
+    [InlineData("Bearer realm=\", DPoP error=use_dpop_nonce,\"", false)]
+    [InlineData("Bearer error=\"use_dpop_nonce\"", false)]
+    [InlineData("Bearer error=\"invalid_token\", DPoP error=\"use_dpop_nonce\"", true)]
+    [InlineData("DPoP realm=\"x\", Bearer error=\"use_dpop_nonce\"", false)]
+    [InlineData("Basic realm=\"x\", DPoP algs=\"ES256\", error=\"use_dpop_nonce\"", true)]
+    [InlineData("DPoP error=\"\"", false)]
+    [InlineData("DPoP error=", false)]
+    [InlineData("DPoP error=\"\", error=\"use_dpop_nonce\"", true)]
+    [InlineData("DPoP", false)]
+    [InlineData("", false)]
+    [InlineData("DPoP error=\"use_dpop_nonce", false)]
+    [InlineData("DPoP error=\"use_dpop_nonce\\\"", false)]
+    [InlineData("DPoP error=\"use_dpop_nonce\\", false)]
+    [InlineData("DPoP realm=\"x, error=\"use_dpop_nonce\"", false)]
+    [InlineData("DPoP error=\"use_dpop_nonce\", realm=\"x", true)]
+    public void ADpopChallengeAsksForANonceWithItsOwnErrorParam(string header, bool asks)
     {
-        Assert.Equal(error, CrossAppAccess.DpopChallengeError(new[] { header }));
-        // A challenge per WWW-Authenticate field.
-        Assert.Equal(error, CrossAppAccess.DpopChallengeError(new[] { "Bearer realm=\"api\"", header }));
+        Assert.Equal(asks, CrossAppAccess.DpopChallengeAsksForNonce(new[] { header }));
+        // A challenge per WWW-Authenticate field; an unclosed quoted string ends with its field.
+        Assert.Equal(asks, CrossAppAccess.DpopChallengeAsksForNonce(new[] { "Bearer realm=\"api\"", header }));
+        Assert.True(CrossAppAccess.DpopChallengeAsksForNonce(new[] { header, "DPoP error=\"use_dpop_nonce\"" }));
+    }
+
+    /// <summary>Through the token endpoint: no retry for an unclosed quoted string, one for a quoted-pair, and the error is never the challenge's.</summary>
+    [Fact]
+    public async Task OnlyAWellFormedDpopChallengeGetsTheRetry()
+    {
+        using var server = new RawEndpoint();
+        using var key = CrossAppAccess.CreateIdJagDpopKey();
+        Task<JsonObject> Redeem() => CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = server.Url, ClientId = "acme", Assertion = "jag", DpopKey = key });
+        foreach (var (challenge, retried) in new[]
+        {
+            ("DPoP error=\"use_dpop_nonce", false), ("DPoP error=\"use_dpop_nonce\\\"", false), ("DPoP error=\"USE_DPOP_NONCE\"", false),
+            ("Bearer realm=\", DPoP error=use_dpop_nonce,\"", false), ("DPoP error=\"invalid_dpop_proof\"", false),
+            ("DPoP error=\"use\\_dpop\\_nonce\"", true), ("dpop ERROR=use_dpop_nonce", true),
+        })
+        {
+            server.Clear();
+            server.Reply = n => RawEndpoint.Answer(401, "", "WWW-Authenticate: " + challenge, "DPoP-Nonce: n" + n);
+            var e = await Assert.ThrowsAsync<TouchqueIdJagException>(Redeem);
+            Assert.Equal(("server_error", (int?)401, retried ? "n2" : "n1"), (e.Error, e.Status, e.DpopNonce));
+            Assert.Equal(retried ? 2 : 1, server.Proofs.Count);
+        }
+        // Two WWW-Authenticate fields, the DPoP challenge in the second: the retry, then the answer.
+        server.Clear();
+        server.Reply = n => n == 1 ? RawEndpoint.Answer(401, "", "WWW-Authenticate: Bearer realm=\"x\"", "WWW-Authenticate: DPoP error=\"use_dpop_nonce\"", "DPoP-Nonce: n1") : RawEndpoint.Answer(200, Tokens);
+        Assert.Equal("at", Json.Str(await Redeem(), "access_token"));
+        Assert.Equal("n1", Json.Str(Parse(server.Proofs[1]!).Claims, "nonce"));
     }
 
     [Fact]
@@ -600,7 +715,7 @@ public class IdJagDpopTests
             (RawEndpoint.Answer(401, "", "WWW-Authenticate: DPoP error=\"\", error_description=\"x\""), "server_error"),
             (RawEndpoint.Answer(401, "{\"error\":\"invalid_client\"}", "WWW-Authenticate: DPoP error=\"\""), "invalid_client"),
             (RawEndpoint.Answer(400, "{\"error\":\"\"}"), "server_error"),
-            (RawEndpoint.Answer(401, "{\"error\":\"\"}", "WWW-Authenticate: DPoP error=\"invalid_token\""), "invalid_token"),
+            (RawEndpoint.Answer(401, "{\"error\":\"\"}", "WWW-Authenticate: DPoP error=\"invalid_token\""), "server_error"),
         })
         {
             server.Reply = _ => answer;
@@ -629,8 +744,8 @@ public class IdJagDpopTests
         })
         {
             var watch = Stopwatch.StartNew();
-            Assert.Null(CrossAppAccess.DpopChallengeError(new[] { header }));
-            Assert.Null(CrossAppAccess.DpopChallengeError(Enumerable.Repeat(header[..640], 100)));
+            Assert.False(CrossAppAccess.DpopChallengeAsksForNonce(new[] { header }));
+            Assert.False(CrossAppAccess.DpopChallengeAsksForNonce(Enumerable.Repeat(header[..640], 100)));
             Assert.Null(CrossAppAccess.ValidDpopNonce(new[] { header }));
             Assert.InRange(watch.ElapsedMilliseconds, 0, 500);
         }
@@ -673,11 +788,12 @@ public class IdJagDpopTests
             Assert.Equal(2, server.Proofs.Count);
         }
 
-        // Over 256 KB of headers HttpClient reads no answer: still a TouchqueIdJagException, not an HttpRequestException.
+        // Over 256 KB of headers HttpClient reads no answer: temporarily_unavailable, with its HttpRequestException inside.
         server.Clear();
         server.Reply = _ => RawEndpoint.Answer(400, NonceAsked, "DPoP-Nonce: " + new string('n', 300_000));
         var big = await Assert.ThrowsAsync<TouchqueIdJagException>(() => Redeem(key));
-        Assert.Equal(("invalid_response", (int?)null, (string?)null), (big.Error, big.Status, big.DpopNonce));
+        Assert.Equal(("temporarily_unavailable", (int?)null, (string?)null), (big.Error, big.Status, big.DpopNonce));
+        Assert.Equal(HttpRequestError.ConfigurationLimitExceeded, Assert.IsType<HttpRequestException>(big.InnerException).HttpRequestError);
     }
 
     [Fact]
@@ -695,26 +811,24 @@ public class IdJagDpopTests
             $"{{\"access_token\":\"a\",\"issued_token_type\":\"{jag}\",\"issued_token_type\":\"{jag}\"}}",
         })
         {
-            server.Reply = _ => RawEndpoint.Answer(200, body);
+            // With the answer's valid nonce, which the error carries.
+            server.Reply = _ => RawEndpoint.Answer(200, body, "DPoP-Nonce: n-200");
             var e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = server.Url, ClientId = "acme", Assertion = "jag" }));
-            Assert.Equal(("invalid_response", (int?)200), (e.Error, e.Status));
+            Assert.Equal(("invalid_response", (int?)200, "n-200"), (e.Error, e.Status, e.DpopNonce));
             e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => CrossAppAccess.RequestIdJagAsync(new()
             {
                 TokenEndpoint = server.Url, ClientId = "tqapp_test", ClientSecret = "tqs_test", IdToken = "idtoken:ada", Audience = "https://rs.example", DpopKey = key,
             }));
-            Assert.Equal(("invalid_response", (int?)200), (e.Error, e.Status));
+            Assert.Equal(("invalid_response", (int?)200, "n-200"), (e.Error, e.Status, e.DpopNonce));
         }
-        // A 2xx answer that is not JSON is read as before: an empty object.
-        server.Reply = _ => RawEndpoint.Answer(200, "not json");
-        Assert.Empty(await CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = server.Url, ClientId = "acme", Assertion = "jag" }));
 
-        // An error answer: its body is not read, so the error is the DPoP challenge's or server_error.
+        // An error answer: its body is not read, so the error is server_error (WWW-Authenticate never names it).
         foreach (var (answer, error) in new[]
         {
             (RawEndpoint.Answer(400, "{\"error\":\"invalid_grant\",\"error\":\"invalid_client\"}"), "server_error"),
             (RawEndpoint.Answer(400, "{\"error\":\"\\udc00\"}"), "server_error"),
             (RawEndpoint.Answer(400, "{\"error\":\"use_dpop_nonce\",\"error\":\"use_dpop_nonce\"}", "DPoP-Nonce: n1"), "server_error"),
-            (RawEndpoint.Answer(401, "{\"error\":\"x\",\"error\":\"y\"}", "WWW-Authenticate: DPoP error=\"invalid_dpop_proof\""), "invalid_dpop_proof"),
+            (RawEndpoint.Answer(401, "{\"error\":\"x\",\"error\":\"y\"}", "WWW-Authenticate: DPoP error=\"invalid_dpop_proof\""), "server_error"),
         })
         {
             server.Clear();
@@ -730,5 +844,291 @@ public class IdJagDpopTests
             : RawEndpoint.Answer(200, Tokens);
         Assert.Equal("at", Json.Str(await CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = server.Url, ClientId = "acme", Assertion = "jag", DpopKey = key }), "access_token"));
         Assert.Equal(2, server.Proofs.Count);
+    }
+
+    internal static Task<JsonObject> RedeemAt(string url, IdJagDpopKey? key, CancellationToken ct = default) =>
+        CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = url, ClientId = "acme", Assertion = "jag", DpopKey = key }, ct);
+
+    private static Task<IdJagGrant> RequestAt(string url, IdJagDpopKey? key) =>
+        CrossAppAccess.RequestIdJagAsync(new() { TokenEndpoint = url, ClientId = "tqapp_test", ClientSecret = "tqs_test", IdToken = "idtoken:ada", Audience = "https://rs.example", DpopKey = key });
+
+    /// <summary>
+    /// Only a 2xx answer is an answer. Any other status is a TouchqueIdJagException with that status, a redirect
+    /// too (none is followed): the body's error, else server_error, and no nonce retry outside 400 and 401.
+    /// </summary>
+    [Fact]
+    public async Task OnlyA2xxAnswerIsAnAnswer()
+    {
+        using var server = new RawEndpoint();
+        using var key = CrossAppAccess.CreateIdJagDpopKey();
+        var idJag = IdJagAnswer("{\"typ\":\"oauth-id-jag+jwt\",\"alg\":\"RS256\"}", new JsonObject());
+        foreach (var status in new[] { 300, 301, 302, 303, 307, 308 })
+        {
+            foreach (var (body, error) in new[] { (Tokens, "server_error"), (idJag, "server_error"), ("{\"error\":\"invalid_request\"}", "invalid_request"), (NonceAsked, "use_dpop_nonce") })
+            {
+                server.Clear();
+                server.Reply = _ => RawEndpoint.Answer(status, body, "Location: " + server.Url + "/elsewhere", "DPoP-Nonce: n1");
+                var e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RedeemAt(server.Url, key));
+                Assert.Equal((error, (int?)status, "n1"), (e.Error, e.Status, e.DpopNonce));
+                e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RequestAt(server.Url, key));
+                Assert.Equal((error, (int?)status, "n1"), (e.Error, e.Status, e.DpopNonce));
+                // One request per call: the Location is never asked.
+                Assert.Equal(2, server.Proofs.Count);
+            }
+        }
+        server.Reply = _ => "HTTP/1.1 304 Not Modified\r\nDPoP-Nonce: n1\r\nConnection: close\r\n\r\n";
+        var notModified = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RedeemAt(server.Url, key));
+        Assert.Equal(("server_error", (int?)304, "n1"), (notModified.Error, notModified.Status, notModified.DpopNonce));
+
+        // Every 2xx with a JSON object is an answer.
+        foreach (var status in new[] { 200, 201, 202, 203, 299 })
+        {
+            server.Reply = _ => RawEndpoint.Answer(status, Tokens);
+            Assert.Equal("at", Json.Str(await RedeemAt(server.Url, key), "access_token"));
+            server.Reply = _ => RawEndpoint.Answer(status, idJag);
+            Assert.False((await RequestAt(server.Url, key)).DpopBound);
+        }
+    }
+
+    /// <summary>
+    /// The error of a refusal is the body's "error" when it is an RFC 6749 error code (%x20-21 / %x23-5B /
+    /// %x5D-7E) of at most 128 characters, else server_error. WWW-Authenticate never names it.
+    /// </summary>
+    [Fact]
+    public async Task TheErrorIsTheBodysOAuthErrorCode()
+    {
+        using var server = new RawEndpoint();
+        var longest = new string('e', 128);
+        foreach (var (value, error) in new (JsonNode?, string)[]
+        {
+            ("invalid_grant", "invalid_grant"), ("invalid grant", "invalid grant"), (" !#$[]^_`{|}~", " !#$[]^_`{|}~"), (longest, longest),
+            (longest + "e", "server_error"), ("a\"b", "server_error"), ("a\\b", "server_error"), ("caf\u00E9", "server_error"), ("a\u0000b", "server_error"),
+            ("a\tb", "server_error"), ("a\nb", "server_error"), ("a\u007Fb", "server_error"), ("\U0001F600", "server_error"), ("", "server_error"),
+            (5, "server_error"), (true, "server_error"), (null, "server_error"), (new JsonObject { ["code"] = "x" }, "server_error"), (new JsonArray("invalid_grant"), "server_error"),
+        })
+        {
+            var body = new JsonObject { ["error"] = value, ["error_description"] = "why" }.ToJsonString();
+            server.Reply = _ => RawEndpoint.Answer(400, body);
+            var e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RedeemAt(server.Url, null));
+            Assert.Equal((error, (int?)400, "why"), (e.Error, e.Status, e.Message));
+            e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RequestAt(server.Url, null));
+            Assert.Equal((error, (int?)400), (e.Error, e.Status));
+            Assert.Equal(error == "server_error" ? null : error, CrossAppAccess.OAuthErrorCode(value is JsonValue v && v.TryGetValue<string>(out var s) ? s : null));
+        }
+
+        // A 401 that names its error only in WWW-Authenticate (use_dpop_nonce too, without a key): server_error.
+        using var key = CrossAppAccess.CreateIdJagDpopKey();
+        foreach (var (answer, withKey, nonce) in new[]
+        {
+            (RawEndpoint.Answer(401, "", "WWW-Authenticate: DPoP error=\"invalid_dpop_proof\""), true, (string?)null),
+            (RawEndpoint.Answer(401, "{\"error\":\"a\\\"b\"}", "WWW-Authenticate: DPoP error=\"invalid_token\""), true, null),
+            (RawEndpoint.Answer(401, "", "WWW-Authenticate: DPoP error=\"use_dpop_nonce\"", "DPoP-Nonce: n1"), false, "n1"),
+        })
+        {
+            server.Clear();
+            server.Reply = _ => answer;
+            var e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RedeemAt(server.Url, withKey ? key : null));
+            Assert.Equal(("server_error", (int?)401, nonce), (e.Error, e.Status, e.DpopNonce));
+            Assert.Single(server.Proofs);
+        }
+        // The retry's answer asks again in its challenge: no second retry, server_error.
+        server.Clear();
+        server.Reply = n => n == 1
+            ? RawEndpoint.Answer(401, "", "WWW-Authenticate: DPoP error=\"use_dpop_nonce\", algs=\"ES256\"", "DPoP-Nonce: n1")
+            : RawEndpoint.Answer(401, "", "WWW-Authenticate: DPoP error=\"use_dpop_nonce\"");
+        var again = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RedeemAt(server.Url, key));
+        Assert.Equal(("server_error", (int?)401, "n1"), (again.Error, again.Status, again.DpopNonce));
+        Assert.Equal(2, server.Proofs.Count);
+    }
+
+    /// <summary>A 2xx answer that is not a JSON object: invalid_response with its status, in both calls, with the answer's nonce.</summary>
+    [Fact]
+    public async Task A2xxAnswerThatIsNotAJsonObjectIsAnInvalidResponse()
+    {
+        using var server = new RawEndpoint();
+        using var key = CrossAppAccess.CreateIdJagDpopKey();
+        foreach (var body in new[] { "", " ", "not json", "<html>hi</html>", "null", "[]", "[{\"access_token\":\"at\"}]", "\"at\"", "5", "true", "{\"access_token\":", "{} {}" })
+        {
+            foreach (var status in new[] { 200, 201 })
+            {
+                server.Reply = _ => RawEndpoint.Answer(status, body, "DPoP-Nonce: n1");
+                var e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RedeemAt(server.Url, key));
+                Assert.Equal(("invalid_response", (int?)status, "n1"), (e.Error, e.Status, e.DpopNonce));
+                e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RequestAt(server.Url, null));
+                Assert.Equal(("invalid_response", (int?)status, "n1"), (e.Error, e.Status, e.DpopNonce));
+            }
+        }
+        server.Reply = _ => RawEndpoint.Answer(204, "");
+        var empty = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RedeemAt(server.Url, null));
+        Assert.Equal(("invalid_response", (int?)204, (string?)null), (empty.Error, empty.Status, empty.DpopNonce));
+    }
+
+    /// <summary>Every error the two calls throw carries the latest valid nonce of the call, whatever answer, or none, ends it.</summary>
+    [Fact]
+    public async Task EveryErrorCarriesTheLatestValidNonce()
+    {
+        using var server = new RawEndpoint();
+        using var key = CrossAppAccess.CreateIdJagDpopKey();
+        var asked = RawEndpoint.Answer(400, NonceAsked, "DPoP-Nonce: n1");
+        foreach (var (second, error, status, nonce) in new (string, string, int?, string)[]
+        {
+            (RawEndpoint.Answer(200, "not json"), "invalid_response", 200, "n1"),
+            (RawEndpoint.Answer(200, "[]", "DPoP-Nonce: n2"), "invalid_response", 200, "n2"),
+            (RawEndpoint.Answer(200, "{\"access_token\":\"a\",\"access_token\":\"b\"}"), "invalid_response", 200, "n1"),
+            (RawEndpoint.Answer(200, "{\"access_token\":\"a\",\"access_token\":\"b\"}", "DPoP-Nonce: n2"), "invalid_response", 200, "n2"),
+            (RawEndpoint.Answer(302, Tokens, "Location: /elsewhere", "DPoP-Nonce: n2"), "server_error", 302, "n2"),
+            (RawEndpoint.Answer(500, "", "DPoP-Nonce: bad nonce"), "server_error", 500, "n1"),
+            (RawEndpoint.Close, "temporarily_unavailable", null, "n1"),
+            (RawEndpoint.Reset, "temporarily_unavailable", null, "n1"),
+        })
+        {
+            server.Clear();
+            server.Reply = n => n == 1 ? asked : second;
+            var e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RedeemAt(server.Url, key));
+            Assert.Equal((error, status, nonce), (e.Error, e.Status, e.DpopNonce));
+            Assert.Equal(2, server.Proofs.Count);
+        }
+
+        // RequestIdJagAsync: a 2xx JSON object that is not an ID-JAG, after the retry or with a nonce of its own.
+        const string notAnIdJag = "{\"access_token\":\"at\",\"token_type\":\"N_A\"}";
+        foreach (var (answers, nonce) in new[]
+        {
+            (new[] { asked, RawEndpoint.Answer(200, notAnIdJag) }, "n1"),
+            (new[] { asked, RawEndpoint.Answer(200, notAnIdJag, "DPoP-Nonce: n2") }, "n2"),
+            (new[] { RawEndpoint.Answer(200, notAnIdJag, "DPoP-Nonce: n3") }, "n3"),
+        })
+        {
+            server.Clear();
+            server.Reply = n => answers[n - 1];
+            var e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RequestAt(server.Url, key));
+            Assert.Equal(("invalid_response", (int?)null, nonce), (e.Error, e.Status, e.DpopNonce));
+            Assert.Equal(answers.Length, server.Proofs.Count);
+        }
+    }
+
+    /// <summary>
+    /// A token endpoint that cannot be reached or read, on the first request or on the nonce retry:
+    /// temporarily_unavailable without a status, with the latest valid nonce of the call and HttpClient's
+    /// exception as the InnerException. Never an HttpRequestException.
+    /// </summary>
+    [Fact]
+    public async Task ATokenEndpointThatCannotBeReadIsTemporarilyUnavailable()
+    {
+        using var server = new RawEndpoint();
+        using var key = CrossAppAccess.CreateIdJagDpopKey();
+        foreach (var failure in new[]
+        {
+            RawEndpoint.Close,
+            RawEndpoint.Reset,
+            // Answers HttpClient refuses: a status that is not a number, a header line without a colon, over 256 KB
+            // of headers, a body shorter than its Content-Length, a chunk size that is not hex.
+            "HTTP/1.1 2x0 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nnot a header line\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            RawEndpoint.Answer(200, Tokens, "X-Long: " + new string('x', 300_000)),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n" + Tokens,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nzz\r\n" + Tokens + "\r\n0\r\n\r\n",
+        })
+        {
+            foreach (var retried in new[] { false, true })
+            {
+                server.Clear();
+                server.Reply = n => retried && n == 1 ? RawEndpoint.Answer(400, NonceAsked, "DPoP-Nonce: n1") : failure;
+                var e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RedeemAt(server.Url, key));
+                Assert.Equal(("temporarily_unavailable", (int?)null, retried ? "n1" : null), (e.Error, e.Status, e.DpopNonce));
+                Assert.IsType<HttpRequestException>(e.InnerException);
+                Assert.Equal(retried ? 2 : 1, server.Proofs.Count);
+                server.Clear();
+                e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RequestAt(server.Url, key));
+                Assert.Equal(("temporarily_unavailable", (int?)null, retried ? "n1" : null), (e.Error, e.Status, e.DpopNonce));
+            }
+        }
+
+        // Nothing listens: the connection is refused, and no request is sent.
+        var refused = RawEndpoint.RefusedUrl();
+        foreach (var dpopKey in new[] { key, null })
+        {
+            var e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RedeemAt(refused, dpopKey));
+            Assert.Equal(("temporarily_unavailable", (int?)null, (string?)null), (e.Error, e.Status, e.DpopNonce));
+            Assert.Equal(HttpRequestError.ConnectionError, Assert.IsType<HttpRequestException>(e.InnerException).HttpRequestError);
+            e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RequestAt(refused, dpopKey));
+            Assert.Equal(("temporarily_unavailable", (int?)null), (e.Error, e.Status));
+        }
+    }
+
+    /// <summary>
+    /// JSON is UTF-8 (RFC 8259): a charset in Content-Type, even one .NET does not know (ReadAsStringAsync threw
+    /// InvalidOperationException on charset=utf8), does not change how an answer reads; a byte order mark is skipped.
+    /// </summary>
+    [Fact]
+    public async Task AnAnswerIsReadAsUtf8WhateverItsCharset()
+    {
+        using var server = new RawEndpoint();
+        static string Utf8Answer(int status, string contentType, string json, bool bom = false)
+        {
+            var bytes = (bom ? "\uFEFF"u8.ToArray() : Array.Empty<byte>()).Concat(Encoding.UTF8.GetBytes(json)).ToArray();
+            return $"HTTP/1.1 {status} Answer\r\nContent-Type: {contentType}\r\nContent-Length: {bytes.Length}\r\nConnection: close\r\n\r\n" + Encoding.Latin1.GetString(bytes);
+        }
+        const string note = "caf\u00E9 \U0001F600";
+        foreach (var contentType in new[] { "application/json", "application/json; charset=utf-8", "application/json; charset=utf8", "application/json; charset=bogus", "text/plain; charset=iso-8859-1" })
+        {
+            server.Reply = _ => Utf8Answer(200, contentType, "{\"access_token\":\"at\",\"note\":\"" + note + "\"}");
+            var tokens = await RedeemAt(server.Url, null);
+            Assert.Equal(("at", note), (Json.Str(tokens, "access_token"), Json.Str(tokens, "note")));
+            server.Reply = _ => Utf8Answer(400, contentType, "{\"error\":\"invalid_grant\",\"error_description\":\"" + note + "\"}");
+            var e = await Assert.ThrowsAsync<TouchqueIdJagException>(() => RedeemAt(server.Url, null));
+            Assert.Equal(("invalid_grant", (int?)400, note), (e.Error, e.Status, e.Message));
+        }
+        server.Reply = _ => Utf8Answer(200, "application/json", Tokens, bom: true);
+        Assert.Equal("at", Json.Str(await RedeemAt(server.Url, null), "access_token"));
+    }
+}
+
+/// <summary>
+/// A token endpoint that never answers: after the shared HttpClient's 10 s timeout, temporarily_unavailable on
+/// the first request or on the nonce retry, with HttpClient's TaskCanceledException (its TimeoutException inside)
+/// as the InnerException. A cancellation the caller asks for stays an OperationCanceledException with the
+/// caller's token. A class of its own, so its 10 s run beside the other tests.
+/// </summary>
+public class IdJagTimeoutTests
+{
+    [Fact]
+    public async Task ATimeoutIsTemporarilyUnavailableButTheCallersCancellationIsNot()
+    {
+        using var silent = new IdJagDpopTests.RawEndpoint { Reply = _ => IdJagDpopTests.RawEndpoint.Hang };
+        using var silentRetry = new IdJagDpopTests.RawEndpoint
+        {
+            Reply = n => n == 1 ? IdJagDpopTests.RawEndpoint.Answer(400, "{\"error\":\"use_dpop_nonce\"}", "DPoP-Nonce: n1") : IdJagDpopTests.RawEndpoint.Hang,
+        };
+        using var key = CrossAppAccess.CreateIdJagDpopKey();
+
+        // The caller cancels while the first request, or the retry, waits for its answer.
+        foreach (var (endpoint, requests) in new[] { (silent, 1), (silentRetry, 2) })
+        {
+            endpoint.Clear();
+            using var cts = new CancellationTokenSource();
+            var call = IdJagDpopTests.RedeemAt(endpoint.Url, key, cts.Token);
+            for (var waited = 0; endpoint.Proofs.Count < requests && waited < 5000; waited += 10) await Task.Delay(10);
+            Assert.Equal(requests, endpoint.Proofs.Count);
+            cts.Cancel();
+            var canceled = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call);
+            Assert.Equal(cts.Token, canceled.CancellationToken);
+        }
+        // A token cancelled before the call: no request.
+        silent.Clear();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => IdJagDpopTests.RedeemAt(silent.Url, key, new CancellationToken(true)));
+        Assert.Empty(silent.Proofs);
+
+        // No cancellation: the 10 s timeout, both at once.
+        silentRetry.Clear();
+        var watch = Stopwatch.StartNew();
+        var first = Assert.ThrowsAsync<TouchqueIdJagException>(() => IdJagDpopTests.RedeemAt(silent.Url, key));
+        var retried = Assert.ThrowsAsync<TouchqueIdJagException>(() => IdJagDpopTests.RedeemAt(silentRetry.Url, key));
+        foreach (var (e, nonce) in new[] { (await first, (string?)null), (await retried, "n1") })
+        {
+            Assert.Equal(("temporarily_unavailable", (int?)null, nonce), (e.Error, e.Status, e.DpopNonce));
+            Assert.IsType<TimeoutException>(Assert.IsType<TaskCanceledException>(e.InnerException).InnerException);
+        }
+        Assert.InRange(watch.Elapsed.TotalSeconds, 9, 30);
+        Assert.Equal(2, silentRetry.Proofs.Count);
     }
 }

@@ -10,7 +10,12 @@ namespace Touchque;
 
 /// <summary>
 /// A refused ID-JAG or exchange (Cross App Access). <see cref="Error"/> is the OAuth error:
-/// <c>invalid_grant</c> for a bad ID-JAG, else what the server answered.
+/// <c>invalid_grant</c> for a bad ID-JAG. From a token endpoint: the <c>error</c> its non-2xx answer
+/// names (an RFC 6749 error code of at most 128 characters), else <c>server_error</c>;
+/// <c>invalid_response</c> for a 2xx answer that is not a JSON object (or, from
+/// <see cref="CrossAppAccess.RequestIdJagAsync"/>, not an ID-JAG); <c>temporarily_unavailable</c> when
+/// the token endpoint could not be reached or its answer read (no <see cref="Status"/>; the cause is
+/// the <see cref="Exception.InnerException"/>).
 /// </summary>
 public class TouchqueIdJagException : TouchqueException
 {
@@ -20,15 +25,30 @@ public class TouchqueIdJagException : TouchqueException
         Status = status;
     }
 
+    /// <summary>The same, with the exception that caused it as <see cref="Exception.InnerException"/>.</summary>
+    public TouchqueIdJagException(string error, string message, int? status, Exception? innerException) : base(message, innerException)
+    {
+        Error = error;
+        Status = status;
+    }
+
     public string Error { get; }
+
+    /// <summary>
+    /// The HTTP status of the token endpoint answer that gave the error: a non-2xx answer, or a 2xx that is not
+    /// a JSON object. Null otherwise: no answer (<c>temporarily_unavailable</c>), a JSON object that is not an
+    /// ID-JAG, or an <see cref="IdJagVerifier"/> error.
+    /// </summary>
     public int? Status { get; }
 
     /// <summary>
-    /// The latest valid <c>DPoP-Nonce</c> the server sent during the call (RFC 9449 section 8): the answer
-    /// to the nonce retry's when it had one, else the first answer's. Only a valid nonce (1*NQCHAR:
-    /// printable ASCII except space, <c>"</c> and <c>\</c>, the same value each time the header repeats);
-    /// otherwise null. A request you send again yourself carries it in a new proof
-    /// (<c>CrossAppAccess.IdJagDpopProof(key, url, nonce: e.DpopNonce)</c>).
+    /// The latest valid <c>DPoP-Nonce</c> the token endpoint sent during the call (RFC 9449 section 8), in
+    /// any of its answers, a 2xx included: the nonce retry's answer's when it had one, else the first
+    /// answer's. Every error <see cref="CrossAppAccess.RequestIdJagAsync"/> and
+    /// <see cref="CrossAppAccess.RedeemIdJagAsync"/> throw carries it (<c>invalid_response</c> and
+    /// <c>temporarily_unavailable</c> too). Only a valid nonce (1*NQCHAR: printable ASCII except space,
+    /// <c>"</c> and <c>\</c>, the same value each time the header repeats); otherwise null. A request you
+    /// send again yourself carries it in a new proof (<c>CrossAppAccess.IdJagDpopProof(key, url, nonce: e.DpopNonce)</c>).
     /// </summary>
     public string? DpopNonce { get; init; }
 }
@@ -142,10 +162,17 @@ public static class CrossAppAccess
 
     /// <summary>
     /// Reads up to 256 KB of response headers (SocketsHttpHandler's default is 64 KB): a token endpoint's
-    /// long <c>WWW-Authenticate</c> or <c>DPoP-Nonce</c> header still gives its answer or a <see cref="TouchqueIdJagException"/>.
+    /// long <c>WWW-Authenticate</c> or <c>DPoP-Nonce</c> header still gives its answer or a <see cref="TouchqueIdJagException"/>
+    /// (more is <c>temporarily_unavailable</c>). Never follows a redirect; a request takes at most 10 s.
     /// </summary>
     private static readonly Lazy<HttpClient> SharedClient = new(() => TouchqueHttp.CreateClient(TimeSpan.FromSeconds(10), maxResponseHeadersKb: 256));
     private static readonly char[] C0OrSpace = Enumerable.Range(0, 0x21).Select(c => (char)c).ToArray();
+
+    /// <summary>
+    /// What a proof's method is trimmed of: ASCII whitespace (space, tab, LF, VT, FF, CR). Not string.Trim()'s
+    /// Unicode whitespace (U+0085, U+00A0, U+2000…), and not NUL: those are not RFC 9110 token characters.
+    /// </summary>
+    private static readonly char[] AsciiWhitespace = { ' ', '\t', '\n', '\v', '\f', '\r' };
 
     /// <summary>Makes a fresh DPoP key for <see cref="RequestIdJagAsync"/> and <see cref="RedeemIdJagAsync"/>.</summary>
     public static IdJagDpopKey CreateIdJagDpopKey() => new(SigningKey.NewEs256());
@@ -155,10 +182,13 @@ public static class CrossAppAccess
     /// endpoint. For a call with the DPoP-bound access token, give the call's method and the token (the
     /// proof carries its hash, ath) and send <c>Authorization: DPoP &lt;token&gt;</c> with
     /// <c>DPoP: &lt;proof&gt;</c>. <paramref name="nonce"/>: the server's <c>DPoP-Nonce</c>, when it asked
-    /// for one. Each proof has a fresh jti and iat, and its jwk is the key's public part only (kty, crv, x, y).
+    /// for one; it goes in as given, unchecked. A null or empty <paramref name="accessToken"/> or
+    /// <paramref name="nonce"/> is left out (no ath, no nonce). Each proof has a fresh jti and iat, and its
+    /// jwk is the key's public part only (kty, crv, x, y).
     /// <para>
-    /// htm is <paramref name="method"/> trimmed and uppercased, POST when it is empty; a method with anything
-    /// but RFC 9110 token characters throws <see cref="TouchqueConfigException"/>.
+    /// htm is <paramref name="method"/> without leading and trailing ASCII whitespace (space, tab, CR, LF, VT,
+    /// FF; not NUL or U+00A0), POST when that leaves nothing, uppercased; a method with anything but RFC 9110
+    /// token characters throws <see cref="TouchqueConfigException"/>.
     /// </para>
     /// <para>
     /// htu is <paramref name="url"/> as System.Uri parses it (it must be an absolute http or https URL, else
@@ -186,12 +216,12 @@ public static class CrossAppAccess
     }
 
     /// <summary>
-    /// A proof's htm: <paramref name="method"/> trimmed and uppercased, POST when empty. An HTTP method is an
-    /// RFC 9110 token, checked before uppercasing (ToUpperInvariant turns "poſt" into POST).
+    /// A proof's htm: <paramref name="method"/> trimmed of ASCII whitespace, POST when empty, uppercased. An
+    /// HTTP method is an RFC 9110 token, checked before uppercasing (ToUpperInvariant turns "poſt" into POST).
     /// </summary>
     internal static string DpopHtm(string? method)
     {
-        var m = (method ?? "").Trim();
+        var m = (method ?? "").Trim(AsciiWhitespace);
         if (m.Length == 0) return "POST";
         foreach (var c in m)
         {
@@ -294,12 +324,15 @@ public static class CrossAppAccess
     }
 
     /// <summary>
-    /// The error a DPoP challenge names (<c>WWW-Authenticate: DPoP error="…"</c>), or null when none does
-    /// (an empty one does not count). One pass over each header value, linear in its length, that never
-    /// throws (RFC 9110 section 11.6.1): a token followed by "=" is an auth-param of the current challenge,
-    /// its value a token or a quoted-string (with \ escapes); any other token starts a new challenge.
+    /// Whether a DPoP challenge in <c>WWW-Authenticate</c> asks for a nonce: its own <c>error</c> parameter is
+    /// exactly <c>use_dpop_nonce</c> (RFC 9449 section 9). It only decides the nonce retry, never the error.
+    /// One pass over each header value, linear in its length, that never throws (RFC 9110 section 11.6.1): a
+    /// token followed by "=" is an auth-param of the current challenge, any other token starts a new one;
+    /// scheme and parameter names are case-insensitive. A value is a token or a quoted-string: a comma inside
+    /// quotes does not split, a quoted-pair (\ and a character) is that character, and a quoted-string without
+    /// its closing quote has no value (the rest of the field value is inside it).
     /// </summary>
-    internal static string? DpopChallengeError(IEnumerable<string> wwwAuthenticate)
+    internal static bool DpopChallengeAsksForNonce(IEnumerable<string> wwwAuthenticate)
     {
         foreach (var v in wwwAuthenticate)
         {
@@ -331,11 +364,18 @@ public static class CrossAppAccess
                 if (j < v.Length && v[j] == '"')
                 {
                     var text = wanted ? new StringBuilder() : null;
-                    for (j++; j < v.Length && v[j] != '"'; j++)
+                    var closed = false;
+                    for (j++; j < v.Length; j++)
                     {
+                        if (v[j] == '"')
+                        {
+                            closed = true;
+                            break;
+                        }
                         if (v[j] == '\\' && j + 1 < v.Length) j++;
                         text?.Append(v[j]);
                     }
+                    if (!closed) break;
                     j++; // the closing quote
                     value = text?.ToString();
                 }
@@ -346,10 +386,25 @@ public static class CrossAppAccess
                     if (wanted) value = v[from..j];
                 }
                 i = j;
-                if (!string.IsNullOrEmpty(value)) return value;
+                if (value == "use_dpop_nonce") return true;
             }
         }
-        return null;
+        return false;
+    }
+
+    /// <summary>
+    /// <paramref name="error"/> when it is an OAuth error code as RFC 6749 section 5.2 writes one
+    /// (%x20-21 / %x23-5B / %x5D-7E: printable ASCII or space, but no <c>"</c> or <c>\</c>), 1 to 128
+    /// characters; otherwise null.
+    /// </summary>
+    internal static string? OAuthErrorCode(string? error)
+    {
+        if (error is not { Length: > 0 and <= 128 }) return null;
+        foreach (var c in error)
+        {
+            if (c is not ('\x20' or '\x21' or (>= '\x23' and <= '\x5B') or (>= '\x5D' and <= '\x7E'))) return null;
+        }
+        return error;
     }
 
     /// <summary>
@@ -371,13 +426,32 @@ public static class CrossAppAccess
         return nonce;
     }
 
-    private static async Task<JsonObject> PostFormAsync(string url, Dictionary<string, string?> form, (string Id, string Secret)? basic, IdJagDpopKey? dpopKey, CancellationToken ct)
+    /// <summary>
+    /// No answer to read: the token endpoint was not reached, reset the connection or timed out (the shared
+    /// client's 10 s), or HttpClient refused its answer (a malformed or oversized header section, a body it
+    /// could not read). A cancellation the caller asked for with <paramref name="ct"/> is not one: it stays
+    /// an OperationCanceledException.
+    /// </summary>
+    private static bool NoAnswer(Exception e, CancellationToken ct) =>
+        (e is HttpRequestException or IOException or OperationCanceledException) && !ct.IsCancellationRequested;
+
+    private static TouchqueIdJagException Unavailable(string url, Exception e, string? latestNonce) =>
+        new("temporarily_unavailable", $"{url} could not be reached or read: {e.Message}", null, e) { DpopNonce = latestNonce };
+
+    /// <summary>
+    /// POSTs a form to a token endpoint: a 2xx answer that is a JSON object, and the latest valid
+    /// <c>DPoP-Nonce</c> the server sent during the call. Anything else is a <see cref="TouchqueIdJagException"/>
+    /// that carries that nonce: another status (a redirect too: none is followed) gives its status and the
+    /// body's OAuth error, else server_error; a 2xx without a JSON object, invalid_response; no answer,
+    /// temporarily_unavailable (<see cref="NoAnswer"/>), with its cause as the InnerException.
+    /// </summary>
+    private static async Task<(JsonObject Data, string? DpopNonce)> PostFormAsync(string url, Dictionary<string, string?> form, (string Id, string Secret)? basic, IdJagDpopKey? dpopKey, CancellationToken ct)
     {
         if (!SafeUrl(url)) throw new TouchqueConfigException($"{url} must be an https URL");
         // The proof names the URL as HttpClient sends it (System.Uri's form: %7E as ~, | as %7C).
         var sent = new Uri(url).AbsoluteUri;
         string? nonce = null;
-        // The latest valid DPoP-Nonce the server sent during this call: the error carries it.
+        // The latest valid DPoP-Nonce the server sent during this call, in any answer: every error carries it.
         string? latestNonce = null;
         while (true)
         {
@@ -398,42 +472,57 @@ public static class CrossAppAccess
             {
                 answer = await SharedClient.Value.SendAsync(req, ct).ConfigureAwait(false);
             }
-            catch (HttpRequestException e) when (e.HttpRequestError == HttpRequestError.ConfigurationLimitExceeded)
+            catch (Exception e) when (NoAnswer(e, ct))
             {
-                // Over 256 KB of headers (a giant DPoP-Nonce or WWW-Authenticate): an answer this SDK does not read.
-                throw new TouchqueIdJagException("invalid_response", $"{url} answered more than this SDK reads: {e.Message}") { DpopNonce = latestNonce };
+                throw Unavailable(url, e, latestNonce);
             }
             using var res = answer;
-            var text = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var answerNonce = res.Headers.NonValidated.TryGetValues("DPoP-Nonce", out var nonces) ? ValidDpopNonce(nonces) : null;
+            latestNonce = answerNonce ?? latestNonce;
+            string text;
+            try
+            {
+                // JSON is UTF-8 (RFC 8259): a charset in Content-Type, even one .NET does not know, changes nothing.
+                text = Encoding.UTF8.GetString(await res.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false));
+            }
+            catch (Exception e) when (NoAnswer(e, ct))
+            {
+                throw Unavailable(url, e, latestNonce);
+            }
+            if (text.StartsWith('\uFEFF')) text = text[1..];
             var status = (int)res.StatusCode;
             // JSON that repeats a member name or holds a lone surrogate would throw ArgumentException or
             // InvalidOperationException on its first read: it is not read at all.
             var json = Json.Parse(text);
-            var readable = json is null || Json.IsIJson(text);
-            if (status < 400)
+            var data = json is JsonObject o && Json.IsIJson(text) ? o : null;
+            if (status is >= 200 and <= 299)
             {
-                if (!readable) throw new TouchqueIdJagException("invalid_response", $"{url} answered JSON that repeats a member name or holds a lone surrogate", status);
-                return json as JsonObject ?? new JsonObject();
+                if (data is not null) return (data, latestNonce);
+                var why = json is JsonObject ? "JSON that repeats a member name or holds a lone surrogate" : "something other than a JSON object";
+                throw new TouchqueIdJagException("invalid_response", $"{url} answered {status} with {why}", status) { DpopNonce = latestNonce };
             }
-            var data = readable ? json as JsonObject : null;
-            var error = Json.Str(data, "error") is { Length: > 0 } named ? named : null;
-            var challenge = status == 401 && res.Headers.NonValidated.TryGetValues("WWW-Authenticate", out var www) ? DpopChallengeError(www) : null;
-            var serverNonce = res.Headers.NonValidated.TryGetValues("DPoP-Nonce", out var nonces) ? ValidDpopNonce(nonces) : null;
-            latestNonce = serverNonce ?? latestNonce;
-            // RFC 9449 section 8: the server wants its nonce in the proof. Once per call (nonce is still null), never in a loop.
-            if (dpopKey is not null && nonce is null && serverNonce is not null && status is 400 or 401 && (error == "use_dpop_nonce" || challenge == "use_dpop_nonce"))
+            // Any other status is a refusal. Its error is the body's (RFC 6749 section 5.2), never WWW-Authenticate's.
+            var error = OAuthErrorCode(Json.Str(data, "error"));
+            // RFC 9449 section 8: the server wants its nonce in the proof, in the body or, for a 401, in a DPoP
+            // challenge. Once per call (nonce is still null), never in a loop.
+            if (dpopKey is not null && nonce is null && answerNonce is not null && status is 400 or 401
+                && (error == "use_dpop_nonce" || (status == 401 && res.Headers.NonValidated.TryGetValues("WWW-Authenticate", out var www) && DpopChallengeAsksForNonce(www))))
             {
-                nonce = serverNonce;
+                nonce = answerNonce;
                 continue;
             }
-            throw new TouchqueIdJagException(error ?? challenge ?? "server_error", Json.Str(data, "error_description") ?? $"{url} answered {status}", status)
+            throw new TouchqueIdJagException(error ?? "server_error", Json.Str(data, "error_description") ?? $"{url} answered {status}", status)
             {
                 DpopNonce = latestNonce,
             };
         }
     }
 
-    /// <summary>Trades a member's ID token for an ID-JAG at the identity provider (token exchange, client_secret_basic).</summary>
+    /// <summary>
+    /// Trades a member's ID token for an ID-JAG at the identity provider (token exchange, client_secret_basic).
+    /// A refusal, an answer that is not an ID-JAG, or a token endpoint that cannot be reached or read throws
+    /// <see cref="TouchqueIdJagException"/>.
+    /// </summary>
     public static async Task<IdJagGrant> RequestIdJagAsync(RequestIdJagOptions o, CancellationToken ct = default)
     {
         var endpoint = o.TokenEndpoint;
@@ -443,7 +532,7 @@ public static class CrossAppAccess
             endpoint = Json.Str(await DiscoverAsync(o.Issuer, GetJsonAsync, ct).ConfigureAwait(false), "token_endpoint")
                 ?? throw new TouchqueConfigException("the identity provider names no token_endpoint");
         }
-        var data = await PostFormAsync(endpoint, new()
+        var (data, nonce) = await PostFormAsync(endpoint, new()
         {
             ["grant_type"] = TokenExchangeGrant, ["requested_token_type"] = IdJagTokenType, ["subject_token"] = o.IdToken,
             ["subject_token_type"] = IdTokenType, ["audience"] = o.Audience, ["resource"] = o.Resource, ["scope"] = o.Scope,
@@ -451,7 +540,7 @@ public static class CrossAppAccess
         var assertion = Json.Str(data, "access_token");
         if (Json.Str(data, "issued_token_type") != IdJagTokenType || string.IsNullOrEmpty(assertion))
         {
-            throw new TouchqueIdJagException("invalid_response", "the identity provider did not answer with an ID-JAG");
+            throw new TouchqueIdJagException("invalid_response", "the identity provider did not answer with an ID-JAG") { DpopNonce = nonce };
         }
         bool? dpopBound = null;
         if (o.DpopKey is not null)
@@ -463,13 +552,17 @@ public static class CrossAppAccess
         return new IdJagGrant(assertion, (int?)Json.Long(data, "expires_in"), Json.Str(data, "scope")) { DpopBound = dpopBound };
     }
 
-    /// <summary>Trades an ID-JAG for an access token at the other service's authorization server (jwt-bearer).</summary>
-    public static Task<JsonObject> RedeemIdJagAsync(RedeemIdJagOptions o, CancellationToken ct = default) =>
-        PostFormAsync(o.TokenEndpoint, new()
+    /// <summary>
+    /// Trades an ID-JAG for an access token at the other service's authorization server (jwt-bearer): its 2xx
+    /// answer, a JSON object. A refusal, any other answer, or a token endpoint that cannot be reached or read
+    /// throws <see cref="TouchqueIdJagException"/>.
+    /// </summary>
+    public static async Task<JsonObject> RedeemIdJagAsync(RedeemIdJagOptions o, CancellationToken ct = default) =>
+        (await PostFormAsync(o.TokenEndpoint, new()
         {
             ["grant_type"] = JwtBearerGrant, ["assertion"] = o.Assertion, ["resource"] = o.Resource, ["scope"] = o.Scope,
             ["client_id"] = string.IsNullOrEmpty(o.ClientSecret) ? o.ClientId : null,
-        }, string.IsNullOrEmpty(o.ClientSecret) ? null : (o.ClientId, o.ClientSecret), o.DpopKey, ct);
+        }, string.IsNullOrEmpty(o.ClientSecret) ? null : (o.ClientId, o.ClientSecret), o.DpopKey, ct).ConfigureAwait(false)).Data;
 }
 
 /// <summary>Settings of <see cref="IdJagVerifier"/>.</summary>
