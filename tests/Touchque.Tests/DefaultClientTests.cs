@@ -1,3 +1,14 @@
+using System.Net.Http.Json;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Touchque.AspNetCore;
+using Touchque.Relay;
 using Xunit;
 
 namespace Touchque.Tests;
@@ -94,6 +105,116 @@ public class DefaultClientTests
         {
             foreach (var (n, v) in saved) Environment.SetEnvironmentVariable(n, v);
             Guard.SetDefaultClient(null);
+        }
+    }
+
+    /// <summary>
+    /// The README's test note: RequireTouchque and MapTouchqueRelay take the TouchqueClient AddTouchque
+    /// registered, never Guard.SetDefaultClient's, so a test replaces that registration with ConfigureTestServices
+    /// (on a generic host, as WebApplicationFactory builds it).
+    /// </summary>
+    [Fact]
+    public async Task TheAdaptersTakeTheRegisteredClientWhichConfigureTestServicesReplaces()
+    {
+        await _api.ResetAsync();
+        await _api.LinkAsync("ada@acme.com");
+        var fake = new TouchqueClient(new TouchqueOptions { ApiKey = "tq_test_key", ApiSecret = "test_secret", BaseUrl = _api.BaseUrl });
+        async Task<IHost> HostAsync(Action<IServiceCollection>? testServices, bool relay) => await new HostBuilder()
+            .ConfigureWebHost(web =>
+            {
+                web.UseTestServer();
+                // The app's own registration, without keys: the client it registers cannot be built.
+                web.ConfigureServices(s => s.AddRouting().AddTouchque(o =>
+                {
+                    o.ApiKey = "";
+                    o.ApiSecret = "";
+                }));
+                web.Configure(app =>
+                {
+                    app.Use((http, next) =>
+                    {
+                        http.User = new ClaimsPrincipal(new ClaimsIdentity(new[] { new Claim(ClaimTypes.Email, "ada@acme.com") }, "test"));
+                        return next(http);
+                    });
+                    app.UseRouting();
+                    app.UseEndpoints(e =>
+                    {
+                        e.MapPost("/pay", () => Results.Ok()).RequireTouchque("SEND_MONEY");
+                        if (relay) e.MapTouchqueRelay("/touchque", new RelayOptions<HttpContext> { GetUserId = http => http.User.TouchqueUser(), GetLoginUser = http => http.User.TouchqueUser() });
+                    });
+                });
+                if (testServices is not null) web.ConfigureTestServices(testServices);
+            })
+            .StartAsync();
+        async Task<(int Pay, int Login)> AnswersAsync(IHost host)
+        {
+            var client = host.GetTestClient();
+            var pay = await client.PostAsync("/pay", null);
+            var login = await client.PostAsync("/touchque/login", JsonContent.Create(new { }));
+            return ((int)pay.StatusCode, (int)login.StatusCode);
+        }
+
+        try
+        {
+            // Guard.SetDefaultClient does not reach them: still 500 misconfigured, and the relay cannot be mapped.
+            Guard.SetDefaultClient(fake);
+            using (var host = await HostAsync(null, relay: false))
+            {
+                Assert.Equal(500, (int)(await host.GetTestClient().PostAsync("/pay", null)).StatusCode);
+            }
+            await Assert.ThrowsAsync<TouchqueConfigException>(() => HostAsync(null, relay: true));
+            Guard.SetDefaultClient(null);
+
+            // AddSingleton after the app's registration wins: both answer from the fake API.
+            using (var host = await HostAsync(s => s.AddSingleton(fake), relay: true))
+            {
+                Assert.Equal((202, 202), await AnswersAsync(host));
+            }
+            // TryAddSingleton keeps the registered client.
+            using (var host = await HostAsync(s => s.TryAddSingleton(fake), relay: false))
+            {
+                Assert.Equal(500, (int)(await host.GetTestClient().PostAsync("/pay", null)).StatusCode);
+            }
+            // Or keep the registered client: test keys in its options, and the fake as its BaseUrl or behind its named HttpClient.
+            using (var host = await HostAsync(s => s.Configure<TouchqueOptions>(o =>
+            {
+                o.ApiKey = "tq_test_key";
+                o.ApiSecret = "test_secret";
+                o.BaseUrl = _api.BaseUrl;
+            }), relay: true))
+            {
+                Assert.Equal((202, 202), await AnswersAsync(host));
+            }
+            using (var host = await HostAsync(s =>
+            {
+                s.Configure<TouchqueOptions>(o =>
+                {
+                    o.ApiKey = "tq_test_key";
+                    o.ApiSecret = "test_secret";
+                });
+                s.AddHttpClient(TouchqueServiceCollectionExtensions.HttpClientName).ConfigurePrimaryHttpMessageHandler(() => new ToFakeApi(_api.BaseUrl));
+            }, relay: true))
+            {
+                Assert.Equal((202, 202), await AnswersAsync(host));
+            }
+        }
+        finally
+        {
+            Guard.SetDefaultClient(null);
+        }
+    }
+
+    /// <summary>A primary handler for the named HttpClient: every request goes to the fake API instead.</summary>
+    private sealed class ToFakeApi : DelegatingHandler
+    {
+        private readonly Uri _base;
+
+        public ToFakeApi(string baseUrl) : base(new SocketsHttpHandler()) => _base = new Uri(baseUrl);
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            request.RequestUri = new Uri(_base, request.RequestUri!.PathAndQuery);
+            return base.SendAsync(request, cancellationToken);
         }
     }
 }

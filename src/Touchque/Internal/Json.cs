@@ -42,6 +42,45 @@ internal static class Json
 
     public static JsonObject ParseObject(string text) => Parse(text) as JsonObject ?? new JsonObject();
 
+    /// <summary>
+    /// Whether JSON text is I-JSON (RFC 7493) in the two ways System.Text.Json only notices when a value
+    /// is first read: no object repeats a member name (ArgumentException) and no string holds a lone
+    /// surrogate (InvalidOperationException). Untrusted JWS parts and token endpoint answers are checked
+    /// with it before any read. <paramref name="checkValues"/> false checks the member names only (a
+    /// webhook may carry a lone surrogate in a value, as JSON.stringify writes one).
+    /// </summary>
+    public static bool IsIJson(string text, bool checkValues = true)
+    {
+        var reader = new Utf8JsonReader(Encoding.UTF8.GetBytes(text));
+        var names = new Stack<HashSet<string>>();
+        try
+        {
+            while (reader.Read())
+            {
+                switch (reader.TokenType)
+                {
+                    case JsonTokenType.StartObject:
+                        names.Push(new HashSet<string>(StringComparer.Ordinal));
+                        break;
+                    case JsonTokenType.EndObject:
+                        names.Pop();
+                        break;
+                    case JsonTokenType.PropertyName:
+                        if (!names.Peek().Add(reader.GetString()!)) return false;
+                        break;
+                    case JsonTokenType.String when checkValues:
+                        _ = reader.GetString();
+                        break;
+                }
+            }
+            return true;
+        }
+        catch (Exception e) when (e is JsonException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>A string field, or null when missing or not a string.</summary>
     public static string? Str(JsonNode? node, string key)
     {

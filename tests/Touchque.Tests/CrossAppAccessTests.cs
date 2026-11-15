@@ -1,5 +1,9 @@
 using System.Text;
 using System.Text.Json.Nodes;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 using Touchque.Internal;
 using Xunit;
 
@@ -75,6 +79,70 @@ public class CrossAppAccessTests : IAsyncLifetime
         var c = Json.ParseObject(Encoding.UTF8.GetString(Base64Url.Decode(parts[1])));
         c["sub"] = "mallory";
         Assert.Equal("signature does not verify", await Reason(() => v.VerifyAsync(parts[0] + "." + Base64Url.Encode(c.ToJsonString()) + "." + parts[2], "acme-at-rs")));
+    }
+
+    [Fact]
+    public async Task DpopBoundRequestRedeemAndVerify()
+    {
+        // An identity provider and an authorization server that check the proof and bind to its key.
+        var seen = new List<(string Path, JsonObject Header, JsonObject Payload, string Jkt)>();
+        var builder = WebApplication.CreateBuilder();
+        builder.Logging.ClearProviders();
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        await using var app = builder.Build();
+        app.Run(async http =>
+        {
+            http.Response.ContentType = "application/json";
+            var proof = JwsVerify.Split(http.Request.Headers["DPoP"].ToString());
+            var jwk = proof?.Header["jwk"] as JsonObject;
+            if (proof is not { } p || jwk is null || !JwsVerify.Verify("ES256", jwk, p.Input, p.Signature))
+            {
+                http.Response.StatusCode = 400;
+                await http.Response.WriteAsync("{\"error\":\"invalid_dpop_proof\"}");
+                return;
+            }
+            var path = http.Request.Path + http.Request.QueryString;
+            var jkt = AgentKeys.Thumbprint(jwk);
+            lock (seen) seen.Add((path, p.Header, p.Claims, jkt));
+            if (path == "/idp/token?x=1")
+            {
+                var jag = Base64Url.Encode("{\"typ\":\"oauth-id-jag+jwt\",\"alg\":\"RS256\"}") + "." + Base64Url.Encode(new JsonObject { ["cnf"] = new JsonObject { ["jkt"] = jkt } }.ToJsonString()) + ".sig";
+                await http.Response.WriteAsync(new JsonObject { ["access_token"] = jag, ["issued_token_type"] = CrossAppAccess.IdJagTokenType, ["token_type"] = "N_A" }.ToJsonString());
+                return;
+            }
+            await http.Response.WriteAsync("{\"access_token\":\"at\",\"token_type\":\"DPoP\"}");
+        });
+        await app.StartAsync();
+        var local = app.Urls.First().TrimEnd('/');
+
+        using var key = CrossAppAccess.CreateIdJagDpopKey();
+        var got = await CrossAppAccess.RequestIdJagAsync(new() { TokenEndpoint = local + "/idp/token?x=1", ClientId = "tqapp_test", ClientSecret = "tqs_test", IdToken = "idtoken:ada", Audience = "https://rs.example", DpopKey = key });
+        Assert.True(got.DpopBound);
+        var tokens = await CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = local + "/rs/token", ClientId = "acme-at-rs", Assertion = got.Assertion, DpopKey = key });
+        Assert.Equal("DPoP", Json.Str(tokens, "token_type"));
+        Assert.Equal(2, seen.Count);
+        Assert.Equal(("dpop+jwt", "ES256", key.Thumbprint), (Json.Str(seen[0].Header, "typ"), Json.Str(seen[0].Header, "alg"), seen[0].Jkt));
+        Assert.False(((JsonObject)seen[0].Header["jwk"]!).ContainsKey("d"));
+        Assert.Equal(("POST", local + "/idp/token"), (Json.Str(seen[0].Payload, "htm"), Json.Str(seen[0].Payload, "htu")));
+        Assert.Equal((local + "/rs/token", key.Thumbprint), (Json.Str(seen[1].Payload, "htu"), seen[1].Jkt));
+        Assert.NotEqual(Json.Str(seen[0].Payload, "jti"), Json.Str(seen[1].Payload, "jti"));
+
+        // An identity provider that ignores DPoP answers with a bearer ID-JAG: DpopBound false.
+        using var other = CrossAppAccess.CreateIdJagDpopKey();
+        var plainJag = await CrossAppAccess.RequestIdJagAsync(new() { Issuer = _api.BaseUrl + "/idp", ClientId = "tqapp_test", ClientSecret = "tqs_test", IdToken = "idtoken:ada", Audience = "https://rs.example", DpopKey = other });
+        Assert.False(plainJag.DpopBound);
+
+        // The verifier: a bound ID-JAG needs the proof key's thumbprint, refused before it is used up.
+        var v = Verifier();
+        async Task<string> Mint(JsonObject claims) => Json.Str(await _api.PostAsync("/__test/id-jag", new JsonObject { ["claims"] = claims }), "assertion")!;
+        var bound = await Mint(new() { ["cnf"] = new JsonObject { ["jkt"] = "right-key-thumbprint" } });
+        Assert.Equal("bound to a DPoP key: a DPoP proof with that key is required", await Reason(() => v.VerifyAsync(bound, "acme-at-rs")));
+        Assert.Equal("the DPoP proof was made with another key", await Reason(() => v.VerifyAsync(bound, "acme-at-rs", "other-key")));
+        Assert.Equal("right-key-thumbprint", (await v.VerifyAsync(bound, "acme-at-rs", "right-key-thumbprint")).CnfJkt);
+        var odd = await Mint(new() { ["cnf"] = new JsonObject { ["x5t"] = "abc" } });
+        Assert.Equal("unsupported confirmation method (only DPoP cnf.jkt)", await Reason(() => v.VerifyAsync(odd, "acme-at-rs", "x")));
+        // Unbound: as before, with or without a proof key.
+        Assert.Null((await v.VerifyAsync(await Mint(new()), "acme-at-rs", "any")).CnfJkt);
     }
 
     private static async Task<string> Code(Func<Task> f)

@@ -233,16 +233,21 @@ internal static class JwsVerify
         return false;
     }
 
-    /// <summary>Header and claims of a compact JWS, or null when it is not one.</summary>
+    /// <summary>
+    /// Header and claims of a compact JWS, or null when it is not one. A part that repeats a member name
+    /// (RFC 7515 section 5.2 allows refusing it) or holds a lone surrogate is refused too: System.Text.Json
+    /// would only throw ArgumentException or InvalidOperationException when the caller first reads it.
+    /// </summary>
     public static (JsonObject Header, JsonObject Claims, byte[] Input, byte[] Signature)? Split(string token)
     {
         var parts = token.Split('.');
         if (parts.Length != 3) return null;
         try
         {
-            var header = Json.Parse(Encoding.UTF8.GetString(Base64Url.Decode(parts[0]))) as JsonObject;
-            var claims = Json.Parse(Encoding.UTF8.GetString(Base64Url.Decode(parts[1]))) as JsonObject;
-            if (header is null || claims is null) return null;
+            var headerJson = Encoding.UTF8.GetString(Base64Url.Decode(parts[0]));
+            var claimsJson = Encoding.UTF8.GetString(Base64Url.Decode(parts[1]));
+            if (Json.Parse(headerJson) is not JsonObject header || Json.Parse(claimsJson) is not JsonObject claims) return null;
+            if (!Json.IsIJson(headerJson) || !Json.IsIJson(claimsJson)) return null;
             return (header, claims, Encoding.ASCII.GetBytes(parts[0] + "." + parts[1]), Base64Url.Decode(parts[2]));
         }
         catch (FormatException)

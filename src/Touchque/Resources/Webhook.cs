@@ -191,7 +191,18 @@ public sealed class WebhookResource
         {
             throw new TouchqueWebhookSignatureException("invalid JSON payload");
         }
-        var provided = string.IsNullOrEmpty(signature) ? Json.Str(payload, "signature") : signature;
+        // A member name twice (or one with a lone surrogate) makes System.Text.Json throw on the first read
+        // of that object; Touchque never sends one. Values may hold a lone surrogate, as JSON.stringify writes it.
+        if (!Json.IsIJson(rawBody, checkValues: false)) throw new TouchqueWebhookSignatureException("invalid JSON payload");
+        string? provided;
+        try
+        {
+            provided = string.IsNullOrEmpty(signature) ? Json.Str(payload, "signature") : signature;
+        }
+        catch (InvalidOperationException)
+        {
+            throw new TouchqueWebhookSignatureException("invalid signature"); // a lone surrogate in the body's signature
+        }
         if (string.IsNullOrEmpty(provided)) throw new TouchqueWebhookSignatureException("no signature provided");
 
         string canonical;

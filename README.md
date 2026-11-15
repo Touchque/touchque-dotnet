@@ -219,6 +219,15 @@ app.MapPost("/transfer", async (Transfer t, HttpContext http) =>
   `TouchqueConfigException`, naming the problem. To give the path a logger, set a client built with
   one: `Guard.SetDefaultClient(new TouchqueClient(new TouchqueOptions { Logger = logger }))`.
   `Guard.SetDefaultClient(null)` forgets it, and the next call builds one from the environment again.
+- Tests: `RequireTouchque()`, `[RequireTouchque]`, `MapTouchqueWebhook` and the handler above take
+  the `TouchqueClient` that `AddTouchque` registers from `RequestServices` on each request, and
+  `MapTouchqueRelay` takes it once, when it maps its routes; none of them uses the client
+  `Guard.SetDefaultClient` sets. An integration test replaces that registration with
+  `ConfigureTestServices`: the `TouchqueClient` singleton (`AddSingleton`, not `TryAddSingleton`,
+  which keeps the registered client), or test keys in `Configure<TouchqueOptions>` with a fake API
+  as `BaseUrl` or a fake handler on the named HttpClient `Touchque`
+  (`TouchqueServiceCollectionExtensions.HttpClientName`):
+  `factory.WithWebHostBuilder(b => b.ConfigureTestServices(s => s.AddSingleton(new TouchqueClient(new TouchqueOptions { ApiKey = "tq_test", ApiSecret = "test", BaseUrl = fakeApiUrl }))))`.
 - Run it after your own checks (ownership, balance), with the details the phone shows, built on
   your server.
 - Not approved: return `r.ToResult(errorBody)`, or `await r.WriteAsync(http, errorBody)` where you
@@ -370,11 +379,36 @@ var jag = await CrossAppAccess.RequestIdJagAsync(new() { Issuer = "https://sso.t
 var tokens = await CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = "https://auth.files.example/token", ClientId = "acme",
     ClientSecret = filesSecret, Assertion = jag.Assertion });
 
-// Your own authorization server (jwt-bearer grant):
+// Your own authorization server (jwt-bearer grant). Build the verifier once and keep it: its
+// used-once jti store and key cache live in the instance.
 var verifier = new IdJagVerifier(new() { Issuer = "https://sso.touchque.com", Audience = "https://auth.files.example" });
+// Then, for each token request:
 var claims = await verifier.VerifyAsync(form["assertion"]!, authenticatedClientId);
 
 await AgentCard.VerifyAsync(cardJson, new() { CardUrl = "https://agent.example/.well-known/agent-card.json" });
+```
+
+**DPoP (optional, RFC 9449).** `CrossAppAccess.CreateIdJagDpopKey()` makes a P-256 key (`IdJagDpopKey`; keep it in this process, dispose it when done). Set it as `DpopKey` on both calls: each sends a fresh proof, and the identity provider binds the ID-JAG to the key (`cnf.jkt` = `dpopKey.Thumbprint`). The grant's `DpopBound` is true when the ID-JAG came back bound, false when the identity provider ignored the proof, null without a key. A token endpoint that asks for a nonce (RFC 9449 section 8: 400 or 401 `use_dpop_nonce` with a `DPoP-Nonce` header) gets the same request once more, with a new proof that carries it, once per call and only for a valid nonce (printable ASCII except space, `"` and `\`, the same value if the header repeats). A `TouchqueIdJagException` carries in `DpopNonce` the latest valid nonce the server sent during the call (null when there was none).
+
+When the access token comes back DPoP-bound (`token_type` `DPoP`), each call to the resource carries `Authorization: DPoP <token>` and `DPoP: <proof>`, a proof for that call's method and URL with the token (`IdJagDpopProof(dpopKey, url, method, accessToken)` adds its hash, `ath`). HttpClient sends the URL in System.Uri's form (`%7E` as `~`, `|` as `%7C`, `.` and `..` segments resolved), so make the proof from the exact URI the request sends, `call.RequestUri!.AbsoluteUri` (the `AbsoluteUri` of the `Uri` object you send), and its method, `call.Method.Method`: then `htu` and `htm` match what the server sees. The proof's `htu` is the URL as System.Uri parses it (an absolute http or https URL, else `TouchqueConfigException`) with the scheme and host lowercased, the default port dropped, `/` for an empty path, the path kept as given (percent-escapes included; only `\`, `.` and `..` segments, and characters a path cannot hold, such as a space, change) and no query or fragment. Its `htm` is the method trimmed and uppercased, `POST` when empty; a method with anything but RFC 9110 token characters throws `TouchqueConfigException`. A resource server that wants a nonce answers 401 `WWW-Authenticate: DPoP error="use_dpop_nonce"` with a `DPoP-Nonce` header: send the call again with a new proof that carries it (`IdJagDpopProof(dpopKey, url, method, accessToken, nonce)`).
+
+An authorization server of another company that accepts Touchque ID-JAGs must verify the DPoP proof itself (`typ`, the signature with the `jwk` in it, `htm`, `htu`, `iat`, each `jti` once) and check `cnf.jkt`, refusing a bound ID-JAG unless the proof key's thumbprint matches it; this SDK's verifier does the `cnf.jkt` part when given the proof key's thumbprint. `VerifyAsync(assertion, clientId, dpopJkt)` checks it before the ID-JAG is used up (`AgentKeys.Thumbprint(jwk)` gives it for a P-256 or Ed25519 key) and sets `CnfJkt` on the claims (null for an unbound ID-JAG, which still passes); the two-argument call refuses bound ID-JAGs.
+
+```csharp
+using var dpopKey = CrossAppAccess.CreateIdJagDpopKey();
+var bound = await CrossAppAccess.RequestIdJagAsync(new() { Issuer = "https://sso.touchque.com", ClientId = clientId,
+    ClientSecret = secret, IdToken = idToken, Audience = "https://auth.files.example", DpopKey = dpopKey });   // bound.DpopBound
+var boundTokens = await CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = "https://auth.files.example/token", ClientId = "acme",
+    ClientSecret = filesSecret, Assertion = bound.Assertion, DpopKey = dpopKey });
+
+// A call with the DPoP-bound access token: a proof for the exact URI and method it sends, with the token.
+var accessToken = (string)boundTokens["access_token"]!;
+using var call = new HttpRequestMessage(HttpMethod.Get, "https://api.files.example/v1/files");
+call.Headers.Authorization = new AuthenticationHeaderValue("DPoP", accessToken);
+call.Headers.Add("DPoP", CrossAppAccess.IdJagDpopProof(dpopKey, call.RequestUri!.AbsoluteUri, call.Method.Method, accessToken));
+
+// Your authorization server, once the request's DPoP proof checks out (proofJwk: the jwk in its header):
+var boundClaims = await verifier.VerifyAsync(form["assertion"]!, authenticatedClientId, AgentKeys.Thumbprint(proofJwk));   // boundClaims.CnfJkt
 ```
 
 ## Shared Signals (security events from Touchque SSO)

@@ -468,6 +468,11 @@ public class AspNetCoreTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.OK, again.StatusCode);
         Assert.True((bool?)(await again.Content.ReadFromJsonAsync<JsonObject>())!["duplicate"]);
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.SendAsync(Delivery(new string('0', 64)))).StatusCode);
+        // A body that repeats a member, without x-signature: 401, not an ArgumentException from reading its signature.
+        var repeated = new HttpRequestMessage(HttpMethod.Post, "/webhooks/touchque") { Content = new StringContent("{\"signature\":\"" + sig + "\",\"signature\":\"x\"}", Encoding.UTF8, "application/json") };
+        var refused = await client.SendAsync(repeated);
+        Assert.Equal(HttpStatusCode.Unauthorized, refused.StatusCode);
+        Assert.Equal("invalid_signature", (string?)(await refused.Content.ReadFromJsonAsync<JsonObject>())!["error"]);
         Assert.Equal(new[] { "APPROVAL_REVOKED" }, events);
     }
 
@@ -571,6 +576,11 @@ public class AspNetCoreTests : IAsyncLifetime
         var scope = await client.SendAsync(Get(Token("openid")));
         Assert.Equal(HttpStatusCode.Forbidden, scope.StatusCode);
         Assert.Contains("insufficient_scope", scope.Headers.WwwAuthenticate.ToString());
+        // A header that repeats a member: 401, not an ArgumentException out of UseAuthentication.
+        var parts = Token("openid read:orders").Split('.');
+        var repeated = await client.SendAsync(Get(Touchque.Internal.Base64Url.Encode("{\"alg\":\"RS256\",\"alg\":\"RS256\",\"typ\":\"at+jwt\",\"kid\":\"k1\"}") + "." + parts[1] + "." + parts[2]));
+        Assert.Equal(HttpStatusCode.Unauthorized, repeated.StatusCode);
+        Assert.Contains("invalid_token", repeated.Headers.WwwAuthenticate.ToString());
     }
 
     [Fact]

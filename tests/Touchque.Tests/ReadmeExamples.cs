@@ -1,8 +1,11 @@
 using System.Globalization;
+using System.Net.Http.Headers;
 using System.Security.Claims;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Touchque.AspNetCore;
 using Touchque.Relay;
@@ -69,18 +72,61 @@ internal static class ReadmeExamples
         await tq.Agents.RedeemApprovalAsync(approved.ApprovalToken!, new ApprovalExpectation { User = "ayse@acme.com", AuthorizationDetails = payment });
     }
 
-    public static async Task CrossAppAccessExamples(string clientId, string secret, string idToken, string filesSecret, string authenticatedClientId, IFormCollection form, string cardJson)
+    public static async Task CrossAppAccessExamples(string clientId, string secret, string idToken, string filesSecret, string authenticatedClientId, IFormCollection form, string cardJson,
+        JsonObject proofJwk)
     {
         var jag = await CrossAppAccess.RequestIdJagAsync(new() { Issuer = "https://sso.touchque.com", ClientId = clientId,
             ClientSecret = secret, IdToken = idToken, Audience = "https://auth.files.example" });
         var tokens = await CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = "https://auth.files.example/token", ClientId = "acme",
             ClientSecret = filesSecret, Assertion = jag.Assertion });
 
-        // Your own authorization server (jwt-bearer grant):
+        // Your own authorization server (jwt-bearer grant). Build the verifier once and keep it: its
+        // used-once jti store and key cache live in the instance.
         var verifier = new IdJagVerifier(new() { Issuer = "https://sso.touchque.com", Audience = "https://auth.files.example" });
+        // Then, for each token request:
         var claims = await verifier.VerifyAsync(form["assertion"]!, authenticatedClientId);
 
         await AgentCard.VerifyAsync(cardJson, new() { CardUrl = "https://agent.example/.well-known/agent-card.json" });
+
+        // DPoP (optional, RFC 9449).
+        using var dpopKey = CrossAppAccess.CreateIdJagDpopKey();
+        var bound = await CrossAppAccess.RequestIdJagAsync(new() { Issuer = "https://sso.touchque.com", ClientId = clientId,
+            ClientSecret = secret, IdToken = idToken, Audience = "https://auth.files.example", DpopKey = dpopKey });   // bound.DpopBound
+        var boundTokens = await CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = "https://auth.files.example/token", ClientId = "acme",
+            ClientSecret = filesSecret, Assertion = bound.Assertion, DpopKey = dpopKey });
+
+        // A call with the DPoP-bound access token: a proof for the exact URI and method it sends, with the token.
+        var accessToken = (string)boundTokens["access_token"]!;
+        using var call = new HttpRequestMessage(HttpMethod.Get, "https://api.files.example/v1/files");
+        call.Headers.Authorization = new AuthenticationHeaderValue("DPoP", accessToken);
+        call.Headers.Add("DPoP", CrossAppAccess.IdJagDpopProof(dpopKey, call.RequestUri!.AbsoluteUri, call.Method.Method, accessToken));
+
+        // Your authorization server, once the request's DPoP proof checks out (proofJwk: the jwk in its header):
+        var boundClaims = await verifier.VerifyAsync(form["assertion"]!, authenticatedClientId, AgentKeys.Thumbprint(proofJwk));   // boundClaims.CnfJkt
+
+        // The prose: the error's nonce, a proof that carries one, and the parts of a resource call's proof.
+        try
+        {
+            await CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = "https://auth.files.example/token", ClientId = "acme", Assertion = bound.Assertion, DpopKey = dpopKey });
+        }
+        catch (TouchqueIdJagException e) when (e.DpopNonce is { } nonce)
+        {
+            _ = CrossAppAccess.IdJagDpopProof(dpopKey, call.RequestUri!.AbsoluteUri, call.Method.Method, accessToken, nonce);
+        }
+        _ = CrossAppAccess.IdJagDpopProof(dpopKey, "https://api.files.example/v1/files", "GET", accessToken);
+    }
+
+    /// <summary>WebApplicationFactory (Microsoft.AspNetCore.Mvc.Testing): only its WithWebHostBuilder is used here.</summary>
+    private sealed class Factory
+    {
+        public Factory WithWebHostBuilder(Action<IWebHostBuilder> configure) => this;
+    }
+
+    /// <summary>"Guard inside your handler", the test bullet.</summary>
+    public static void TestServicesExample(string fakeApiUrl)
+    {
+        var factory = new Factory();
+        factory.WithWebHostBuilder(b => b.ConfigureTestServices(s => s.AddSingleton(new TouchqueClient(new TouchqueOptions { ApiKey = "tq_test", ApiSecret = "test", BaseUrl = fakeApiUrl }))));
     }
 
     public static async Task SharedSignalsExample(WebApplication app, string pollUrl, string streamToken, IReadOnlyList<string> handled,

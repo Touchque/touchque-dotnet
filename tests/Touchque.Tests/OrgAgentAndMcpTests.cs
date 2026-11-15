@@ -164,6 +164,11 @@ public class OrgAgentAndMcpTests : IAsyncLifetime
         Assert.True((await auth.VerifyAsync("POST", Resource, new Dictionary<string, string> { ["Authorization"] = "DPoP " + token, ["DPoP"] = good })).DpopBound);
         Assert.Equal("invalid_dpop_proof", (await Assert.ThrowsAsync<TouchqueMcpAuthException>(() => auth.VerifyAsync("POST", Resource, new Dictionary<string, string> { ["Authorization"] = "DPoP " + token, ["DPoP"] = good }))).Error);
         await Assert.ThrowsAsync<TouchqueMcpAuthException>(() => auth.VerifyAsync("POST", Resource, new Dictionary<string, string> { ["Authorization"] = "DPoP " + token, ["DPoP"] = Proof("https://other.example/mcp") }));
+        // A proof whose header repeats a member: malformed, not an ArgumentException from System.Text.Json.
+        var parts = Proof().Split('.');
+        var repeated = Base64Url.Encode("{\"typ\":\"dpop+jwt\",\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":" + jwk.ToJsonString() + "}") + "." + parts[1] + "." + parts[2];
+        var e = await Assert.ThrowsAsync<TouchqueMcpAuthException>(() => auth.VerifyAsync("POST", Resource, new Dictionary<string, string> { ["Authorization"] = "DPoP " + token, ["DPoP"] = repeated }));
+        Assert.Equal((401, "invalid_dpop_proof", "DPoP proof: malformed"), (e.Status, e.Error, e.Message));
     }
 
     [Fact]

@@ -13,7 +13,7 @@ namespace Touchque.Internal;
 /// </summary>
 internal sealed class TouchqueHttp
 {
-    internal const string SdkVersion = "5.2.0";
+    internal const string SdkVersion = "5.3.0";
     private const int MaxResponseBytes = 10 * 1024 * 1024;
 
     private readonly HttpClient _client;
@@ -31,9 +31,12 @@ internal sealed class TouchqueHttp
 
     public SdkLog Log => _options.Log;
 
-    /// <summary>An HttpClient that never follows redirects: a redirect could replay the signed headers to another host.</summary>
-    internal static HttpClient CreateClient(TimeSpan timeout) =>
-        new(new SocketsHttpHandler { AllowAutoRedirect = false, PooledConnectionLifetime = TimeSpan.FromMinutes(5) })
+    /// <summary>
+    /// An HttpClient that never follows redirects: a redirect could replay the signed headers to another host.
+    /// <paramref name="maxResponseHeadersKb"/>: the most response header bytes it reads, in KB (64 is SocketsHttpHandler's default).
+    /// </summary>
+    internal static HttpClient CreateClient(TimeSpan timeout, int maxResponseHeadersKb = 64) =>
+        new(new SocketsHttpHandler { AllowAutoRedirect = false, PooledConnectionLifetime = TimeSpan.FromMinutes(5), MaxResponseHeadersLength = maxResponseHeadersKb })
         {
             Timeout = timeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(10) : timeout,
         };

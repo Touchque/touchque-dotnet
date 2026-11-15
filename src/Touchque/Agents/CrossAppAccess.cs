@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 using Touchque.Internal;
@@ -20,6 +22,15 @@ public class TouchqueIdJagException : TouchqueException
 
     public string Error { get; }
     public int? Status { get; }
+
+    /// <summary>
+    /// The latest valid <c>DPoP-Nonce</c> the server sent during the call (RFC 9449 section 8): the answer
+    /// to the nonce retry's when it had one, else the first answer's. Only a valid nonce (1*NQCHAR:
+    /// printable ASCII except space, <c>"</c> and <c>\</c>, the same value each time the header repeats);
+    /// otherwise null. A request you send again yourself carries it in a new proof
+    /// (<c>CrossAppAccess.IdJagDpopProof(key, url, nonce: e.DpopNonce)</c>).
+    /// </summary>
+    public string? DpopNonce { get; init; }
 }
 
 /// <summary>What <see cref="CrossAppAccess.RequestIdJagAsync"/> needs.</summary>
@@ -37,10 +48,46 @@ public sealed record RequestIdJagOptions
     public required string Audience { get; init; }
     public string? Resource { get; init; }
     public string? Scope { get; init; }
+    /// <summary>
+    /// Binds the ID-JAG to this key (DPoP, RFC 9449); redeem it with the same key. A server that asks
+    /// for a DPoP nonce (<c>use_dpop_nonce</c> with a valid <c>DPoP-Nonce</c>) gets the request once more,
+    /// with a proof that carries it.
+    /// </summary>
+    public IdJagDpopKey? DpopKey { get; init; }
 }
 
 /// <summary>An ID-JAG the identity provider issued.</summary>
-public sealed record IdJagGrant(string Assertion, int? ExpiresIn, string? Scope);
+public sealed record IdJagGrant(string Assertion, int? ExpiresIn, string? Scope)
+{
+    /// <summary>
+    /// With a <see cref="RequestIdJagOptions.DpopKey"/>: whether the returned ID-JAG carries that key's
+    /// thumbprint (cnf.jkt); an identity provider without DPoP support ignores the proof. Null without one.
+    /// </summary>
+    public bool? DpopBound { get; init; }
+}
+
+/// <summary>
+/// A DPoP key (RFC 9449, P-256) that binds an ID-JAG, and the access token redeemed with it, to its
+/// holder; keep it in this process. Make one with <see cref="CrossAppAccess.CreateIdJagDpopKey"/>.
+/// </summary>
+public sealed class IdJagDpopKey : IDisposable
+{
+    internal IdJagDpopKey(SigningKey key)
+    {
+        Key = key;
+        Thumbprint = AgentKeys.Thumbprint(key.PublicJwk);
+    }
+
+    internal SigningKey Key { get; }
+
+    /// <summary>kty, crv, x, y: the public key only.</summary>
+    public JsonObject PublicJwk => (JsonObject)Key.PublicJwk.DeepClone();
+
+    /// <summary>RFC 7638 thumbprint: the ID-JAG's cnf.jkt.</summary>
+    public string Thumbprint { get; }
+
+    public void Dispose() => Key.Dispose();
+}
 
 /// <summary>What <see cref="CrossAppAccess.RedeemIdJagAsync"/> needs.</summary>
 public sealed record RedeemIdJagOptions
@@ -51,6 +98,13 @@ public sealed record RedeemIdJagOptions
     public required string Assertion { get; init; }
     public string? Resource { get; init; }
     public string? Scope { get; init; }
+    /// <summary>
+    /// The key the ID-JAG is bound to: a DPoP proof goes along, and the access token is then DPoP-bound
+    /// too (each call with it needs a proof: <see cref="CrossAppAccess.IdJagDpopProof"/> with the method and
+    /// the token). A server that asks for a DPoP nonce (with a valid <c>DPoP-Nonce</c>) gets the request once
+    /// more, with a proof that carries it.
+    /// </summary>
+    public IdJagDpopKey? DpopKey { get; init; }
 }
 
 /// <summary>
@@ -67,6 +121,17 @@ public sealed record RedeemIdJagOptions
 /// var tokens = await CrossAppAccess.RedeemIdJagAsync(new() { TokenEndpoint = "https://auth.files.example/token", ClientId = "acme",
 ///     ClientSecret = filesSecret, Assertion = jag.Assertion });
 /// </code>
+/// Sender-constrained with DPoP (RFC 9449), optional: give the same key to both calls. The ID-JAG is
+/// then bound to it (cnf.jkt) and is useless to anyone who copies it without the key.
+/// <code>
+/// using var dpopKey = CrossAppAccess.CreateIdJagDpopKey();
+/// var jag = await CrossAppAccess.RequestIdJagAsync(new() { /* as above */ DpopKey = dpopKey });   // jag.DpopBound
+/// var tokens = await CrossAppAccess.RedeemIdJagAsync(new() { /* as above */ Assertion = jag.Assertion, DpopKey = dpopKey });
+/// // A call with the DPoP-bound access token: a proof for the exact URI and method it sends.
+/// using var call = new HttpRequestMessage(HttpMethod.Get, "https://api.files.example/v1/files");
+/// call.Headers.Authorization = new AuthenticationHeaderValue("DPoP", (string)tokens["access_token"]!);
+/// call.Headers.Add("DPoP", CrossAppAccess.IdJagDpopProof(dpopKey, call.RequestUri!.AbsoluteUri, call.Method.Method, (string)tokens["access_token"]!));
+/// </code>
 /// </summary>
 public static class CrossAppAccess
 {
@@ -75,7 +140,137 @@ public static class CrossAppAccess
     public const string TokenExchangeGrant = "urn:ietf:params:oauth:grant-type:token-exchange";
     public const string JwtBearerGrant = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
-    private static readonly Lazy<HttpClient> SharedClient = new(() => TouchqueHttp.CreateClient(TimeSpan.FromSeconds(10)));
+    /// <summary>
+    /// Reads up to 256 KB of response headers (SocketsHttpHandler's default is 64 KB): a token endpoint's
+    /// long <c>WWW-Authenticate</c> or <c>DPoP-Nonce</c> header still gives its answer or a <see cref="TouchqueIdJagException"/>.
+    /// </summary>
+    private static readonly Lazy<HttpClient> SharedClient = new(() => TouchqueHttp.CreateClient(TimeSpan.FromSeconds(10), maxResponseHeadersKb: 256));
+    private static readonly char[] C0OrSpace = Enumerable.Range(0, 0x21).Select(c => (char)c).ToArray();
+
+    /// <summary>Makes a fresh DPoP key for <see cref="RequestIdJagAsync"/> and <see cref="RedeemIdJagAsync"/>.</summary>
+    public static IdJagDpopKey CreateIdJagDpopKey() => new(SigningKey.NewEs256());
+
+    /// <summary>
+    /// A DPoP proof (RFC 9449) with <paramref name="key"/> for one request: by default a POST to a token
+    /// endpoint. For a call with the DPoP-bound access token, give the call's method and the token (the
+    /// proof carries its hash, ath) and send <c>Authorization: DPoP &lt;token&gt;</c> with
+    /// <c>DPoP: &lt;proof&gt;</c>. <paramref name="nonce"/>: the server's <c>DPoP-Nonce</c>, when it asked
+    /// for one. Each proof has a fresh jti and iat, and its jwk is the key's public part only (kty, crv, x, y).
+    /// <para>
+    /// htm is <paramref name="method"/> trimmed and uppercased, POST when it is empty; a method with anything
+    /// but RFC 9110 token characters throws <see cref="TouchqueConfigException"/>.
+    /// </para>
+    /// <para>
+    /// htu is <paramref name="url"/> as System.Uri parses it (it must be an absolute http or https URL, else
+    /// <see cref="TouchqueConfigException"/>): scheme and host lowercased (an IDN host in punycode), user info
+    /// and the default port dropped, "/" for an empty path, no query or fragment. The path is kept as given,
+    /// percent-escapes included, except that "\" counts as "/", "." and ".." segments are resolved, and a
+    /// character a URL path cannot hold as it is (a space, non-ASCII, <c>" &lt; &gt; ^ ` { }</c>) is
+    /// percent-encoded as UTF-8. HttpClient sends a URL in System.Uri's form (%7E as ~, | as %7C): make the
+    /// proof from the exact URI you send, <c>request.RequestUri.AbsoluteUri</c>, so that htu matches.
+    /// </para>
+    /// </summary>
+    public static string IdJagDpopProof(IdJagDpopKey key, string url, string method = "POST", string? accessToken = null, string? nonce = null)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        var claims = new JsonObject
+        {
+            ["htm"] = DpopHtm(method), ["htu"] = DpopHtu(url), ["iat"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            ["jti"] = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant(),
+        };
+        claims.Put("ath", string.IsNullOrEmpty(accessToken) ? null : AgentKeys.AccessTokenHash(accessToken)).Put("nonce", nonce);
+        // The jwk is rebuilt for each proof from the key's public point: exactly kty, crv, x and y.
+        var pub = key.Key.PublicJwk;
+        var jwk = new JsonObject { ["kty"] = Json.Str(pub, "kty"), ["crv"] = Json.Str(pub, "crv"), ["x"] = Json.Str(pub, "x"), ["y"] = Json.Str(pub, "y") };
+        return key.Key.Jws(new JsonObject { ["typ"] = "dpop+jwt", ["jwk"] = jwk }, claims);
+    }
+
+    /// <summary>
+    /// A proof's htm: <paramref name="method"/> trimmed and uppercased, POST when empty. An HTTP method is an
+    /// RFC 9110 token, checked before uppercasing (ToUpperInvariant turns "poſt" into POST).
+    /// </summary>
+    internal static string DpopHtm(string? method)
+    {
+        var m = (method ?? "").Trim();
+        if (m.Length == 0) return "POST";
+        foreach (var c in m)
+        {
+            if (!IsTchar(c)) throw new TouchqueConfigException($"IdJagDpopProof: \"{method}\" is not an HTTP method (RFC 9110 token characters only)");
+        }
+        return m.ToUpperInvariant();
+    }
+
+    /// <summary>An RFC 9110 tchar: an ASCII letter or digit, or one of !#$%&amp;'*+-.^_`|~.</summary>
+    private static bool IsTchar(char c) =>
+        c is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9')
+            or '!' or '#' or '$' or '%' or '&' or '\'' or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~';
+
+    /// <summary>
+    /// A proof's htu: scheme://host[:port]/path of <paramref name="url"/> as System.Uri parses it, without
+    /// user info, query or fragment: scheme and host lowercased (an IDN host in punycode), no default port,
+    /// "/" for an empty path. The path keeps its own percent-escapes as given (<see cref="Uri"/> would decode
+    /// %7E and the like); only "\" (as "/"), "." and ".." segments (also as %2e), and characters a path
+    /// cannot hold as they are (percent-encoded as UTF-8) change.
+    /// </summary>
+    internal static string DpopHtu(string url)
+    {
+        // No leading or trailing C0 control or space, no tab or newline anywhere.
+        var s = (url ?? "").Trim(C0OrSpace).Replace("\t", "").Replace("\n", "").Replace("\r", "");
+        if (!Uri.TryCreate(s, UriKind.Absolute, out var u) || u.Scheme is not ("https" or "http") || u.Host.Length == 0)
+        {
+            throw new TouchqueConfigException($"{url} must be an absolute https or http URL");
+        }
+        var host = (u.HostNameType == UriHostNameType.Dns ? u.IdnHost : u.Host).ToLowerInvariant();
+        // The path as written: after the scheme, the slashes and the authority, up to the query or fragment.
+        var at = s.IndexOf(':') + 1;
+        while (at < s.Length && s[at] is '/' or '\\') at++;
+        var start = s.IndexOfAny(new[] { '/', '\\', '?', '#' }, at);
+        start = start < 0 ? s.Length : start;
+        var end = s.IndexOfAny(new[] { '?', '#' }, start);
+        var path = s[start..(end < 0 ? s.Length : end)];
+        // Segment by segment: \ is /, "." and ".." segments (also as %2e) go, other code points are kept or
+        // UTF-8 percent-encoded (space, controls, non-ASCII and " # < > ? ^ ` { }), and a % stays as written.
+        var segments = new List<string>();
+        var segment = new StringBuilder();
+        Span<byte> utf8 = stackalloc byte[4];
+        var i = path.Length > 0 && path[0] is '/' or '\\' ? 1 : 0;
+        while (true)
+        {
+            if (i < path.Length && path[i] is not ('/' or '\\'))
+            {
+                Rune.DecodeFromUtf16(path.AsSpan(i), out var rune, out var used);
+                i += used;
+                if (rune.Value is > 0x20 and < 0x7F and not ('"' or '#' or '<' or '>' or '?' or '^' or '`' or '{' or '}'))
+                {
+                    segment.Append((char)rune.Value);
+                    continue;
+                }
+                var n = rune.EncodeToUtf8(utf8);
+                for (var k = 0; k < n; k++) segment.Append('%').Append(utf8[k].ToString("X2", CultureInfo.InvariantCulture));
+                continue;
+            }
+            var last = i >= path.Length;
+            var text = segment.ToString();
+            var dots = text.Replace("%2e", ".", StringComparison.OrdinalIgnoreCase);
+            if (dots == "..")
+            {
+                if (segments.Count > 0) segments.RemoveAt(segments.Count - 1);
+                if (last) segments.Add("");
+            }
+            else if (dots == ".")
+            {
+                if (last) segments.Add("");
+            }
+            else
+            {
+                segments.Add(text);
+            }
+            if (last) break;
+            segment.Clear();
+            i++;
+        }
+        return u.Scheme + "://" + host + (u.IsDefaultPort ? "" : ":" + u.Port.ToString(CultureInfo.InvariantCulture)) + "/" + string.Join('/', segments);
+    }
 
     /// <summary>https, or http on this machine (tests).</summary>
     internal static bool SafeUrl(string? url) =>
@@ -98,27 +293,144 @@ public static class CrossAppAccess
         return meta;
     }
 
-    private static async Task<JsonObject> PostFormAsync(string url, Dictionary<string, string?> form, (string Id, string Secret)? basic, CancellationToken ct)
+    /// <summary>
+    /// The error a DPoP challenge names (<c>WWW-Authenticate: DPoP error="…"</c>), or null when none does
+    /// (an empty one does not count). One pass over each header value, linear in its length, that never
+    /// throws (RFC 9110 section 11.6.1): a token followed by "=" is an auth-param of the current challenge,
+    /// its value a token or a quoted-string (with \ escapes); any other token starts a new challenge.
+    /// </summary>
+    internal static string? DpopChallengeError(IEnumerable<string> wwwAuthenticate)
+    {
+        foreach (var v in wwwAuthenticate)
+        {
+            var dpop = false;
+            var i = 0;
+            while (i < v.Length)
+            {
+                if (!IsTchar(v[i]))
+                {
+                    i++; // "," or a space between elements, or a stray character
+                    continue;
+                }
+                var start = i;
+                while (i < v.Length && IsTchar(v[i])) i++;
+                var name = v.AsSpan(start, i - start);
+                var j = i;
+                while (j < v.Length && v[j] is ' ' or '\t') j++;
+                if (j == v.Length || v[j] != '=')
+                {
+                    // An auth-scheme (or a token68 after one, which no DPoP challenge has).
+                    dpop = name.Equals("DPoP", StringComparison.OrdinalIgnoreCase);
+                    i = j;
+                    continue;
+                }
+                j++;
+                while (j < v.Length && v[j] is ' ' or '\t') j++;
+                var wanted = dpop && name.Equals("error", StringComparison.OrdinalIgnoreCase);
+                string? value = null;
+                if (j < v.Length && v[j] == '"')
+                {
+                    var text = wanted ? new StringBuilder() : null;
+                    for (j++; j < v.Length && v[j] != '"'; j++)
+                    {
+                        if (v[j] == '\\' && j + 1 < v.Length) j++;
+                        text?.Append(v[j]);
+                    }
+                    j++; // the closing quote
+                    value = text?.ToString();
+                }
+                else
+                {
+                    var from = j;
+                    while (j < v.Length && IsTchar(v[j])) j++;
+                    if (wanted) value = v[from..j];
+                }
+                i = j;
+                if (!string.IsNullOrEmpty(value)) return value;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The <c>DPoP-Nonce</c> of an answer when it is one valid nonce (RFC 9449: 1*NQCHAR, printable ASCII
+    /// except space, " and \); null when the header is missing, empty or invalid, or repeats with another value.
+    /// </summary>
+    internal static string? ValidDpopNonce(IEnumerable<string> values)
+    {
+        string? nonce = null;
+        foreach (var v in values)
+        {
+            if (v.Length == 0 || (nonce is not null && v != nonce)) return null;
+            foreach (var c in v)
+            {
+                if (c is not ('\x21' or (>= '\x23' and <= '\x5B') or (>= '\x5D' and <= '\x7E'))) return null;
+            }
+            nonce = v;
+        }
+        return nonce;
+    }
+
+    private static async Task<JsonObject> PostFormAsync(string url, Dictionary<string, string?> form, (string Id, string Secret)? basic, IdJagDpopKey? dpopKey, CancellationToken ct)
     {
         if (!SafeUrl(url)) throw new TouchqueConfigException($"{url} must be an https URL");
-        using var req = new HttpRequestMessage(HttpMethod.Post, url)
+        // The proof names the URL as HttpClient sends it (System.Uri's form: %7E as ~, | as %7C).
+        var sent = new Uri(url).AbsoluteUri;
+        string? nonce = null;
+        // The latest valid DPoP-Nonce the server sent during this call: the error carries it.
+        string? latestNonce = null;
+        while (true)
         {
-            Content = new FormUrlEncodedContent(form.Where(kv => kv.Value is not null).Select(kv => new KeyValuePair<string, string>(kv.Key, kv.Value!))),
-        };
-        req.Headers.Accept.ParseAdd("application/json");
-        if (basic is { } b)
-        {
-            var raw = Uri.EscapeDataString(b.Id) + ":" + Uri.EscapeDataString(b.Secret);
-            req.Headers.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes(raw)));
+            using var req = new HttpRequestMessage(HttpMethod.Post, url)
+            {
+                Content = new FormUrlEncodedContent(form.Where(kv => kv.Value is not null).Select(kv => new KeyValuePair<string, string>(kv.Key, kv.Value!))),
+            };
+            req.Headers.Accept.ParseAdd("application/json");
+            // A fresh proof (jti, iat) for each request; the second one carries the server's nonce.
+            if (dpopKey is not null) req.Headers.TryAddWithoutValidation("DPoP", IdJagDpopProof(dpopKey, sent, nonce: nonce));
+            if (basic is { } b)
+            {
+                var raw = Uri.EscapeDataString(b.Id) + ":" + Uri.EscapeDataString(b.Secret);
+                req.Headers.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes(raw)));
+            }
+            HttpResponseMessage answer;
+            try
+            {
+                answer = await SharedClient.Value.SendAsync(req, ct).ConfigureAwait(false);
+            }
+            catch (HttpRequestException e) when (e.HttpRequestError == HttpRequestError.ConfigurationLimitExceeded)
+            {
+                // Over 256 KB of headers (a giant DPoP-Nonce or WWW-Authenticate): an answer this SDK does not read.
+                throw new TouchqueIdJagException("invalid_response", $"{url} answered more than this SDK reads: {e.Message}") { DpopNonce = latestNonce };
+            }
+            using var res = answer;
+            var text = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var status = (int)res.StatusCode;
+            // JSON that repeats a member name or holds a lone surrogate would throw ArgumentException or
+            // InvalidOperationException on its first read: it is not read at all.
+            var json = Json.Parse(text);
+            var readable = json is null || Json.IsIJson(text);
+            if (status < 400)
+            {
+                if (!readable) throw new TouchqueIdJagException("invalid_response", $"{url} answered JSON that repeats a member name or holds a lone surrogate", status);
+                return json as JsonObject ?? new JsonObject();
+            }
+            var data = readable ? json as JsonObject : null;
+            var error = Json.Str(data, "error") is { Length: > 0 } named ? named : null;
+            var challenge = status == 401 && res.Headers.NonValidated.TryGetValues("WWW-Authenticate", out var www) ? DpopChallengeError(www) : null;
+            var serverNonce = res.Headers.NonValidated.TryGetValues("DPoP-Nonce", out var nonces) ? ValidDpopNonce(nonces) : null;
+            latestNonce = serverNonce ?? latestNonce;
+            // RFC 9449 section 8: the server wants its nonce in the proof. Once per call (nonce is still null), never in a loop.
+            if (dpopKey is not null && nonce is null && serverNonce is not null && status is 400 or 401 && (error == "use_dpop_nonce" || challenge == "use_dpop_nonce"))
+            {
+                nonce = serverNonce;
+                continue;
+            }
+            throw new TouchqueIdJagException(error ?? challenge ?? "server_error", Json.Str(data, "error_description") ?? $"{url} answered {status}", status)
+            {
+                DpopNonce = latestNonce,
+            };
         }
-        using var res = await SharedClient.Value.SendAsync(req, ct).ConfigureAwait(false);
-        var data = Json.ParseObject(await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
-        var status = (int)res.StatusCode;
-        if (status >= 400)
-        {
-            throw new TouchqueIdJagException(Json.Str(data, "error") ?? "server_error", Json.Str(data, "error_description") ?? $"{url} answered {status}", status);
-        }
-        return data;
     }
 
     /// <summary>Trades a member's ID token for an ID-JAG at the identity provider (token exchange, client_secret_basic).</summary>
@@ -135,13 +447,20 @@ public static class CrossAppAccess
         {
             ["grant_type"] = TokenExchangeGrant, ["requested_token_type"] = IdJagTokenType, ["subject_token"] = o.IdToken,
             ["subject_token_type"] = IdTokenType, ["audience"] = o.Audience, ["resource"] = o.Resource, ["scope"] = o.Scope,
-        }, (o.ClientId, o.ClientSecret), ct).ConfigureAwait(false);
+        }, (o.ClientId, o.ClientSecret), o.DpopKey, ct).ConfigureAwait(false);
         var assertion = Json.Str(data, "access_token");
         if (Json.Str(data, "issued_token_type") != IdJagTokenType || string.IsNullOrEmpty(assertion))
         {
             throw new TouchqueIdJagException("invalid_response", "the identity provider did not answer with an ID-JAG");
         }
-        return new IdJagGrant(assertion, (int?)Json.Long(data, "expires_in"), Json.Str(data, "scope"));
+        bool? dpopBound = null;
+        if (o.DpopKey is not null)
+        {
+            // An identity provider without DPoP support ignores the proof: say so instead of guessing.
+            var claims = JwsVerify.Split(assertion)?.Claims;
+            dpopBound = claims?["cnf"] is JsonObject cnf && Json.Str(cnf, "jkt") is { } jkt && jkt == o.DpopKey.Thumbprint;
+        }
+        return new IdJagGrant(assertion, (int?)Json.Long(data, "expires_in"), Json.Str(data, "scope")) { DpopBound = dpopBound };
     }
 
     /// <summary>Trades an ID-JAG for an access token at the other service's authorization server (jwt-bearer).</summary>
@@ -150,7 +469,7 @@ public static class CrossAppAccess
         {
             ["grant_type"] = JwtBearerGrant, ["assertion"] = o.Assertion, ["resource"] = o.Resource, ["scope"] = o.Scope,
             ["client_id"] = string.IsNullOrEmpty(o.ClientSecret) ? o.ClientId : null,
-        }, string.IsNullOrEmpty(o.ClientSecret) ? null : (o.ClientId, o.ClientSecret), ct);
+        }, string.IsNullOrEmpty(o.ClientSecret) ? null : (o.ClientId, o.ClientSecret), o.DpopKey, ct);
 }
 
 /// <summary>Settings of <see cref="IdJagVerifier"/>.</summary>
@@ -190,15 +509,21 @@ public sealed record IdJagClaims
     public string? Email { get; init; }
     public long? AuthTime { get; init; }
     public IReadOnlyList<string> Amr { get; init; } = Array.Empty<string>();
+    /// <summary>The DPoP key thumbprint the ID-JAG is bound to (cnf.jkt), when it is.</summary>
+    public string? CnfJkt { get; init; }
     public JsonObject Claims { get; init; } = new();
 }
 
 /// <summary>
 /// Your authorization server, taking ID-JAGs from an organization's identity provider:
 /// checks the one an authenticated client presents (jwt-bearer grant) and uses it once.
+/// Build one and keep it (a singleton): its used-once jti store and key cache live in the instance.
 /// <code>
 /// var verifier = new IdJagVerifier(new() { Issuer = "https://sso.touchque.com", Audience = "https://auth.files.example" });
+/// // Per token request:
 /// var claims = await verifier.VerifyAsync(form["assertion"], authenticatedClientId);
+/// // An authorization server that checks DPoP proofs passes the proof key's thumbprint:
+/// var bound = await verifier.VerifyAsync(form["assertion"], authenticatedClientId, dpopJkt);
 /// </code>
 /// </summary>
 public sealed class IdJagVerifier
@@ -272,8 +597,20 @@ public sealed class IdJagVerifier
         }
     }
 
-    /// <summary>The ID-JAG, checked and used once; throws <see cref="TouchqueIdJagException"/> (Error invalid_grant).</summary>
-    public async Task<IdJagClaims> VerifyAsync(string assertion, string clientId, CancellationToken ct = default)
+    /// <summary>
+    /// The ID-JAG, checked and used once; throws <see cref="TouchqueIdJagException"/> (Error invalid_grant).
+    /// An ID-JAG bound to a DPoP key (cnf.jkt) is refused: pass the proof's thumbprint for those.
+    /// </summary>
+    public Task<IdJagClaims> VerifyAsync(string assertion, string clientId, CancellationToken ct = default) =>
+        VerifyAsync(assertion, clientId, null, ct);
+
+    /// <summary>
+    /// The ID-JAG, checked and used once. <paramref name="dpopJkt"/>: the thumbprint of the key of the DPoP
+    /// proof you verified on this request (<see cref="AgentKeys.Thumbprint"/> of its jwk), if any; an ID-JAG
+    /// bound to a key (cnf.jkt) is refused without a matching one. The proof itself (typ, its signature
+    /// with its jwk, htm, htu, iat, each jti once) is yours to check.
+    /// </summary>
+    public async Task<IdJagClaims> VerifyAsync(string assertion, string clientId, string? dpopJkt, CancellationToken ct = default)
     {
         static TouchqueIdJagException Bad(string m) => new("invalid_grant", m);
         var parts = JwsVerify.Split(assertion ?? "") ?? throw Bad("assertion is not a JWT");
@@ -305,6 +642,15 @@ public sealed class IdJagVerifier
         if (exp is null || exp.Value + skew < now) throw Bad("expired");
         if (iat is null || iat.Value - skew > now) throw Bad("issued in the future");
         if (string.IsNullOrEmpty(sub) || string.IsNullOrEmpty(jti)) throw Bad("sub and jti are required");
+        // Before the jti is spent: a copy without the key cannot use the ID-JAG up.
+        string? cnfJkt = null;
+        if (c.ContainsKey("cnf"))
+        {
+            if (c["cnf"] is not JsonObject cnf || Json.Str(cnf, "jkt") is not { } jkt) throw Bad("unsupported confirmation method (only DPoP cnf.jkt)");
+            if (string.IsNullOrEmpty(dpopJkt)) throw Bad("bound to a DPoP key: a DPoP proof with that key is required");
+            if (dpopJkt != jkt) throw Bad("the DPoP proof was made with another key");
+            cnfJkt = jkt;
+        }
         if (!(_o.FirstUse ?? RememberOnce)(jti, exp.Value)) throw Bad("already used");
         var scope = Json.Str(c, "scope");
         return new IdJagClaims
@@ -313,6 +659,7 @@ public sealed class IdJagVerifier
             Scopes = string.IsNullOrEmpty(scope) ? Array.Empty<string>() : scope.Split(' '),
             Resource = Json.Str(c, "resource"), Tenant = Json.Str(c, "tenant"), Email = Json.Str(c, "email"), AuthTime = Json.Long(c, "auth_time"),
             Amr = c["amr"] is JsonArray amr ? amr.Select(x => x?.ToString() ?? "").ToList() : Array.Empty<string>(),
+            CnfJkt = cnfJkt,
             Claims = c,
         };
     }

@@ -160,14 +160,18 @@ public static class AgentCard
 
     private static JsonObject Decode(string cardJson)
     {
+        JsonObject card;
         try
         {
-            return JsonNode.Parse(cardJson) as JsonObject ?? throw new TouchqueAgentCardException("malformed", "the card is not a JSON object");
+            card = JsonNode.Parse(cardJson) as JsonObject ?? throw new TouchqueAgentCardException("malformed", "the card is not a JSON object");
         }
         catch (JsonException)
         {
             throw new TouchqueAgentCardException("malformed", "the card is not JSON");
         }
+        // RFC 8785 needs I-JSON; System.Text.Json would only throw on the first read of such a member.
+        if (!Json.IsIJson(cardJson)) throw new TouchqueAgentCardException("malformed", "the card repeats a member name or holds a lone surrogate");
+        return card;
     }
 
     private static string Payload(JsonObject card)
@@ -199,15 +203,17 @@ public static class AgentCard
             var sigText = Json.Str(s, "signature");
             if (string.IsNullOrEmpty(prot) || string.IsNullOrEmpty(sigText)) continue;
             JsonObject? head;
+            string headJson;
             try
             {
-                head = JsonNode.Parse(Encoding.UTF8.GetString(Base64Url.Decode(prot))) as JsonObject;
+                headJson = Encoding.UTF8.GetString(Base64Url.Decode(prot));
+                head = JsonNode.Parse(headJson) as JsonObject;
             }
             catch (Exception e) when (e is FormatException or JsonException)
             {
                 continue;
             }
-            if (head is null) continue;
+            if (head is null || !Json.IsIJson(headJson)) continue;
             var alg = Json.Str(head, "alg");
             var kid = Json.Str(head, "kid");
             if (alg is null || !Algs.Contains(alg) || string.IsNullOrEmpty(kid) || head.ContainsKey("crit")) continue;
