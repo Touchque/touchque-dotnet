@@ -199,6 +199,15 @@ internal static class ReadmeExamples
         public Task<Transfer> SendAsync(Transfer t) => Task.FromResult(t);
     }
 
+    /// <summary>"Linking the phone (first-time QR)".</summary>
+    public static async Task SetupContextExample(TouchqueClient tq, HttpContext http, string userId, string secret)
+    {
+        var qr = await tq.Auth.GenerateSecretAsync(userId, http.TouchqueClientIp(), http.Request.Headers.UserAgent);
+        _ = qr.QrCodeDataUrl;
+        var check = await tq.Auth.ValidateSecretAsync(secret);
+        _ = (check.SetupContext?.Ip, check.SetupContext?.Location?.City, check.SetupContext?.Device?.Browser, check.SetupContext?.RequestedAt, check.SetupContext?.FarFromPhone);
+    }
+
     /// <summary>"Refusals in your app's error shape" and "Guard inside your handler".</summary>
     public static void GuardExamples(WebApplicationBuilder builder, WebApplication app)
     {

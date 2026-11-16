@@ -299,6 +299,23 @@ the first-time QR on `/login`: without `GetLoginUser`, a user with no phone gets
 `{"state": "enroll", "reason": "enrollment_off"}`. Adding a passkey for a user with a linked phone
 waits for the phone first.
 
+## Linking the phone (first-time QR)
+
+Before it links, the Touchque app shows where the QR was asked for: the IP address with its city
+and country, the browser and the system, so someone tricked into scanning an attacker's QR sees
+the attacker's place and device. Touchque records this from the request that asked for the QR,
+never in the QR itself. `RequireTouchque`, `MapTouchqueRelay` and `Guard.RunAsync` send the
+browser's IP and User-Agent for you, the ones their login requests carry (`tq.StartAsync` sends
+`StartOptions.Ip` and `UserAgent`). When you call `GenerateSecretAsync` yourself, pass them from the
+request as you do for a login; `ValidateSecretAsync` returns what Touchque recorded as `SetupContext`.
+
+```csharp
+var qr = await tq.Auth.GenerateSecretAsync(userId, http.TouchqueClientIp(), http.Request.Headers.UserAgent);
+// show qr.QrCodeDataUrl. The secret the phone scanned, checked:
+var check = await tq.Auth.ValidateSecretAsync(secret);
+// check.SetupContext?.Ip, .Location?.City, .Device?.Browser, .RequestedAt, .FarFromPhone: each may be null
+```
+
 ## Webhooks
 
 ```csharp

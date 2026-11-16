@@ -109,7 +109,7 @@ public sealed record RelayOptions<TRequest>
 /// 2FA, offline codes and passkeys, so you don't hand-write them. Same routes and
 /// behaviour as the Node SDK's <c>touchqueRouter</c>:
 /// <code>
-/// POST   /enroll/start                  (signed in)   generateSecret response
+/// POST   /enroll/start                  (signed in)   generateSecret response (asked with the browser's IP and User-Agent)
 /// GET    /enroll/status                 (signed in)   { linked, used, deviceId }
 /// POST   /login                         (pre-auth)    202 { touchque: step, token } until approved
 /// POST   /offline/challenge             (pre-auth)    QR for a phone with no internet
@@ -189,9 +189,11 @@ public sealed class RelayHandler<TRequest>
     {
         var userId = UserId(req);
         if (userId is null) return Unauthorized();
+        // The browser asking for the QR, exactly as /login sends it: the phone shows where the QR was asked for.
+        var (ip, userAgent) = (ClientIp(req), req.UserAgent);
         try
         {
-            return new RelayResponse(200, Json.ToNode(await _tq.Auth.GenerateSecretAsync(userId, ct).ConfigureAwait(false)));
+            return new RelayResponse(200, Json.ToNode(await _tq.Auth.GenerateSecretAsync(userId, ip, userAgent, ct).ConfigureAwait(false)));
         }
         catch (TouchqueApiException e) when (e.Status == 409)
         {
@@ -205,7 +207,7 @@ public sealed class RelayHandler<TRequest>
                 {
                     return new RelayResponse(409, new JsonObject { ["error"] = "already_linked", ["message"] = "A phone is already linked to this account." });
                 }
-                return new RelayResponse(200, Json.ToNode(await _tq.Auth.ResetSecretAsync(userId, ct).ConfigureAwait(false)));
+                return new RelayResponse(200, Json.ToNode(await _tq.Auth.ResetSecretAsync(userId, ip, userAgent, ct).ConfigureAwait(false)));
             }
             catch (Exception retry) when (retry is not OperationCanceledException)
             {
@@ -292,7 +294,7 @@ public sealed class RelayHandler<TRequest>
             User = user,
             Action = action,
             Details = details,
-            Ip = req.Ip.Length > 0 ? req.Ip : null,
+            Ip = ClientIp(req),
             UserAgent = req.UserAgent,
             Token = NonEmpty(req.Header(Guard.TokenHeader)),
             Offline = offline is "1" or "true",
@@ -305,6 +307,9 @@ public sealed class RelayHandler<TRequest>
     }
 
     private static string? NonEmpty(string? s) => string.IsNullOrEmpty(s) ? null : s;
+
+    /// <summary>The end user's IP as /login and /enroll/start send it: null when unknown ("").</summary>
+    private static string? ClientIp(RelayRequest<TRequest> req) => req.Ip.Length > 0 ? req.Ip : null;
 
     /// <summary>A step or a refusal, as every adapter sends it (the same answer as <c>RequireTouchque</c>'s without an ErrorBody).</summary>
     private static RelayResponse GuardResponse(GuardResult result)

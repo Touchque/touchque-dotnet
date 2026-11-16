@@ -84,8 +84,9 @@ public sealed record StartOptions
     public required string User { get; init; }
     public IReadOnlyList<LoginDetail>? Details { get; init; }
     public string? ReferenceId { get; init; }
-    /// <summary>The end user's IP.</summary>
+    /// <summary>The end user's IP: sent with the push, and with a first-time QR (the phone shows where it was asked for).</summary>
     public string? Ip { get; init; }
+    /// <summary>The end user's User-Agent, sent like <see cref="Ip"/>.</summary>
     public string? UserAgent { get; init; }
     /// <summary>Silent sign-ins: the <c>X-Touchque-Browser</c> header, passed through untouched.</summary>
     public string? BrowserProof { get; init; }
@@ -165,7 +166,7 @@ internal static class Steps
             if (e.Status == 404 && (code == "device_not_linked" || e.Message.Contains("linked device", StringComparison.OrdinalIgnoreCase)))
             {
                 // No QR may be shown here: say why, so a page stops instead of polling a step it cannot finish.
-                return o.Enroll ? await EnrollStepAsync(client, o.User, ct).ConfigureAwait(false) : new Step { State = "enroll", Reason = "enrollment_off" };
+                return o.Enroll ? await EnrollStepAsync(client, o, ct).ConfigureAwait(false) : new Step { State = "enroll", Reason = "enrollment_off" };
             }
             if (e.Status == 423) return new Step { State = "frozen", RetryAfter = e.RetryAfter, CaseCode = caseCode };
             if (e.Status == 429) return new Step { State = "rate_limited", RetryAfter = e.RetryAfter, CaseCode = caseCode };
@@ -185,12 +186,16 @@ internal static class Steps
         }
     }
 
-    /// <summary>First-time linking. Never unlinks a phone: a secret is only re-issued when the account is confirmed NOT linked.</summary>
-    private static async Task<Step> EnrollStepAsync(TouchqueClient client, string user, CancellationToken ct)
+    /// <summary>
+    /// First-time linking. Never unlinks a phone: a secret is only re-issued when the account is confirmed NOT linked.
+    /// The QR is asked for with the end user's IP and User-Agent the login request carried, so the phone shows where it was asked for.
+    /// </summary>
+    private static async Task<Step> EnrollStepAsync(TouchqueClient client, StartOptions o, CancellationToken ct)
     {
+        var user = o.User;
         try
         {
-            var gen = await client.Auth.GenerateSecretAsync(user, ct).ConfigureAwait(false);
+            var gen = await client.Auth.GenerateSecretAsync(user, clientIp: o.Ip, userAgent: o.UserAgent, ct).ConfigureAwait(false);
             return new Step { State = "enroll", Enroll = new StepEnroll { QrCodeDataUrl = gen.QrCodeDataUrl, RecoveryCodes = gen.RecoveryCodes, ExpiresAt = QrExpiresAt(gen.ExpiresAt, gen.TtlMs) } };
         }
         catch (TouchqueApiException e) when (e.Status == 409)
@@ -208,7 +213,7 @@ internal static class Steps
             {
                 return new Step { State = "enroll", Reason = "already_linked" };
             }
-            var reset = await client.Auth.ResetSecretAsync(user, ct).ConfigureAwait(false);
+            var reset = await client.Auth.ResetSecretAsync(user, clientIp: o.Ip, userAgent: o.UserAgent, ct).ConfigureAwait(false);
             return new Step { State = "enroll", Enroll = new StepEnroll { QrCodeDataUrl = reset.QrCodeDataUrl, RecoveryCodes = reset.RecoveryCodes, ExpiresAt = QrExpiresAt(reset.ExpiresAt, reset.TtlMs) } };
         }
     }

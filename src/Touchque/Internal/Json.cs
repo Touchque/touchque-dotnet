@@ -298,3 +298,46 @@ internal sealed class LenientStringConverter : JsonConverter<string?>
         else writer.WriteStringValue(value);
     }
 }
+
+/// <summary>A JSON true or false; anything else (a string "true", a number, an object, null) is null, instead of failing the whole answer.</summary>
+internal sealed class LenientBoolConverter : JsonConverter<bool?>
+{
+    public override bool? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        switch (reader.TokenType)
+        {
+            case JsonTokenType.True: return true;
+            case JsonTokenType.False: return false;
+            default:
+                reader.Skip();
+                return null;
+        }
+    }
+
+    public override void Write(Utf8JsonWriter writer, bool? value, JsonSerializerOptions options)
+    {
+        if (value is { } b) writer.WriteBooleanValue(b);
+        else writer.WriteNullValue();
+    }
+}
+
+/// <summary>
+/// An object field that may come in another shape: a JSON object is read as <typeparamref name="T"/>,
+/// anything else (a string, a number, an array) as null, instead of failing the whole answer.
+/// Put it on the property, never on the type (it reads the type with its own contract).
+/// </summary>
+internal sealed class LenientObjectConverter<T> : JsonConverter<T?> where T : class
+{
+    public override T? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.StartObject) return JsonSerializer.Deserialize<T>(ref reader, options);
+        reader.Skip();
+        return null;
+    }
+
+    public override void Write(Utf8JsonWriter writer, T? value, JsonSerializerOptions options)
+    {
+        if (value is null) writer.WriteNullValue();
+        else JsonSerializer.Serialize(writer, value, options);
+    }
+}

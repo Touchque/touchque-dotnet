@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [5.4.0] — 2026-11-16
+
+### Added
+- **2FA setup context: the phone shows where a first-time QR was asked for.** `Auth.GenerateSecretAsync(externalUsername, clientIp, userAgent)` and `Auth.ResetSecretAsync(externalUsername, clientIp, userAgent)` send the end user's IP and User-Agent (`clientIp`, `userAgent`, both optional) with the same rule as a login request: each only when not null or empty, as given (no trimming, no length cap). Touchque records where a QR was asked for from the request that asked for it, never in the QR, and the phone shows it before it links. The `(externalUsername, ct)` overloads stay and send the user only.
+  - The adapters send them for you, the same ones their login requests carry: the guard's first-time QR and its renewal (`RequireTouchque`, `[RequireTouchque]`, `Guard.RunAsync`, `tq.StartAsync` with `StartOptions.Ip` / `UserAgent`) and the relay's `POST /enroll/start`, with its reset after a 409 (`MapTouchqueRelay`, `RelayHandler`). In ASP.NET Core the IP is `TouchqueClientIp()` as for a login: `Connection.RemoteIpAddress`, behind `UseForwardedHeaders` with your proxy as a known proxy the address it saw, never the leftmost `X-Forwarded-For`; no address, none sent.
+  - `ValidateSecretResult.SetupContext` (`SetupContext`: `Ip`, `Location`, `Device`, `RequestedAt` (ISO 8601, kept as a string), `FarFromPhone`), with `SetupLocation` (`City`, `Country`, `CountryCode`) and `SetupDevice` (`Browser`, `Os`, `Model`). Every field is nullable; the context is null when the answer has none (an older QR, an API before this change). Read leniently: a field that is missing, null or of another type is null, never an error; unknown fields are kept in `Extra`.
+  - README: "Linking the phone (first-time QR)"; its snippet is compiled with the tests.
+
+### Changed
+- Docs: `DeviceRiskSignal.Code` lists the codes the API now returns too: `device_pointer_synthetic`, `device_new_storage_burst` and `device_network_signup_burst` (phones are told apart only by their stored id and key since 2026-11-15, so the risk engine counts new browsers and sign-ups per kind of phone and network). No code change.
+
 ## [5.3.0] — 2026-11-15
 
 ### Added

@@ -181,7 +181,10 @@ public sealed record DeviceRiskSignal
     /// <c>device_tampered</c>, <c>device_virtual</c>, <c>device_geo_mismatch</c>, <c>device_many_accounts</c>,
     /// <c>device_signup_burst</c>, <c>device_id_resets</c>, <c>device_many_countries</c>, <c>device_wrong_site</c>,
     /// <c>device_report_replayed</c>, <c>device_private_window</c> (context only), <c>device_step_up_by_admin</c>,
-    /// <c>device_identification_missing</c> (no identification, or one that does not verify).
+    /// <c>device_identification_missing</c> (no identification, or one that does not verify),
+    /// <c>device_pointer_synthetic</c> (the pointer or a finger moved like software), <c>device_new_storage_burst</c>
+    /// and <c>device_network_signup_burst</c> (many new browsers, or sign-ups, in a day from phones like this one on
+    /// this network). New codes are added in minor versions.
     /// </summary>
     public string Code { get; init; } = "";
     /// <summary>English text.</summary>

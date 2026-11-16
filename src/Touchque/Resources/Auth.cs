@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using Touchque.Internal;
 
 namespace Touchque;
@@ -13,18 +14,44 @@ public sealed class AuthResource
     /// <summary>
     /// A new setup secret for a user: show <see cref="GenerateSecretResult.QrCodeDataUrl"/> so
     /// the Touchque app links the phone. 409 when an unscanned or used secret exists
-    /// (<see cref="ResetSecretAsync"/> issues a new one).
+    /// (<see cref="ResetSecretAsync(string, string, string, CancellationToken)"/> issues a new one).
     /// </summary>
-    public Task<GenerateSecretResult> GenerateSecretAsync(string externalUsername, CancellationToken ct = default) =>
-        _http.PostAsync<GenerateSecretResult>("/auth/generate-secret", new JsonObject { ["externalUsername"] = externalUsername }, ct);
+    /// <param name="clientIp">
+    /// The END user's IP, from the request that asks for the QR, as for a login request (sent only
+    /// when not null or empty). Touchque keeps it with the secret, never in the QR: before linking,
+    /// the phone shows where the QR was asked for (<see cref="ValidateSecretResult.SetupContext"/>).
+    /// </param>
+    /// <param name="userAgent">The end user's User-Agent, from the same request (sent only when not null or empty).</param>
+    public Task<GenerateSecretResult> GenerateSecretAsync(string externalUsername, string? clientIp = null, string? userAgent = null, CancellationToken ct = default) =>
+        _http.PostAsync<GenerateSecretResult>("/auth/generate-secret", SecretBody(externalUsername, clientIp, userAgent), ct);
+
+    /// <summary>A new setup secret for a user, without the end user's IP and User-Agent.</summary>
+    public Task<GenerateSecretResult> GenerateSecretAsync(string externalUsername, CancellationToken ct) =>
+        GenerateSecretAsync(externalUsername, null, null, ct);
 
     /// <summary>Regenerates a user's secret.</summary>
-    public Task<ResetSecretResult> ResetSecretAsync(string externalUsername, CancellationToken ct = default) =>
-        _http.PostAsync<ResetSecretResult>("/auth/secret/reset", new JsonObject { ["externalUsername"] = externalUsername }, ct);
+    /// <param name="clientIp">
+    /// The END user's IP, from the request that asks for the new QR, sent like
+    /// <see cref="GenerateSecretAsync(string, string, string, CancellationToken)"/>'s: only when not null or empty.
+    /// </param>
+    /// <param name="userAgent">The end user's User-Agent, from the same request (sent only when not null or empty).</param>
+    public Task<ResetSecretResult> ResetSecretAsync(string externalUsername, string? clientIp = null, string? userAgent = null, CancellationToken ct = default) =>
+        _http.PostAsync<ResetSecretResult>("/auth/secret/reset", SecretBody(externalUsername, clientIp, userAgent), ct);
 
-    /// <summary>Checks a setup secret code.</summary>
+    /// <summary>Regenerates a user's secret, without the end user's IP and User-Agent.</summary>
+    public Task<ResetSecretResult> ResetSecretAsync(string externalUsername, CancellationToken ct) =>
+        ResetSecretAsync(externalUsername, null, null, ct);
+
+    /// <summary>
+    /// Checks a setup secret code. A valid one carries <see cref="ValidateSecretResult.SetupContext"/>:
+    /// where its QR was asked for.
+    /// </summary>
     public Task<ValidateSecretResult> ValidateSecretAsync(string secret, CancellationToken ct = default) =>
         _http.PostAsync<ValidateSecretResult>("/auth/secret/validate", new JsonObject { ["secret"] = secret }, ct);
+
+    /// <summary>The user, and the end user's IP and User-Agent with the same rule as a login request: each only when not null or empty.</summary>
+    private static JsonObject SecretBody(string externalUsername, string? clientIp, string? userAgent) =>
+        new JsonObject { ["externalUsername"] = externalUsername }.Put("clientIp", clientIp).Put("userAgent", userAgent);
 
     /// <summary>
     /// A user's link status without sending a push: <see cref="TouchqueUser.Used"/> flips true and
@@ -68,6 +95,73 @@ public sealed record ValidateSecretResult : TouchqueObject
     public string? Reason { get; init; }
     public string? UsedAt { get; init; }
     public string? ExpiredAt { get; init; }
+
+    /// <summary>
+    /// Where the QR of this secret was asked for, which the phone shows before it links: null for
+    /// an older QR, an API before setup context, or a QR asked for without the end user's IP and
+    /// User-Agent. Read leniently: an answer of another shape is null, never an error.
+    /// </summary>
+    [JsonConverter(typeof(LenientObjectConverter<SetupContext>))]
+    public SetupContext? SetupContext { get; init; }
+}
+
+/// <summary>
+/// 2FA setup context: where a first-time linking QR was asked for (the browser that asked for it,
+/// as the API recorded it from that request), shown on the phone before it links. Someone tricked
+/// into scanning an attacker's QR sees the attacker's place and device. Every field may be null;
+/// one the API sends in another shape is null too.
+/// </summary>
+public sealed record SetupContext : TouchqueObject
+{
+    /// <summary>The IP address the QR was asked from, or null.</summary>
+    [JsonConverter(typeof(LenientStringConverter))]
+    public string? Ip { get; init; }
+
+    /// <summary>Where that address is (GeoIP), or null when unknown.</summary>
+    [JsonConverter(typeof(LenientObjectConverter<SetupLocation>))]
+    public SetupLocation? Location { get; init; }
+
+    /// <summary>The browser and system from its User-Agent, or null when unknown.</summary>
+    [JsonConverter(typeof(LenientObjectConverter<SetupDevice>))]
+    public SetupDevice? Device { get; init; }
+
+    /// <summary>When the QR was asked for (ISO 8601), as the API sent it.</summary>
+    [JsonConverter(typeof(LenientStringConverter))]
+    public string? RequestedAt { get; init; }
+
+    /// <summary>True when the QR was asked for far from the phone that checks it, false when not, null when Touchque cannot tell.</summary>
+    [JsonConverter(typeof(LenientBoolConverter))]
+    public bool? FarFromPhone { get; init; }
+}
+
+/// <summary>Where a setup request came from (GeoIP).</summary>
+public sealed record SetupLocation : TouchqueObject
+{
+    [JsonConverter(typeof(LenientStringConverter))]
+    public string? City { get; init; }
+
+    [JsonConverter(typeof(LenientStringConverter))]
+    public string? Country { get; init; }
+
+    /// <summary>ISO 3166-1 alpha-2, e.g. <c>DE</c>.</summary>
+    [JsonConverter(typeof(LenientStringConverter))]
+    public string? CountryCode { get; init; }
+}
+
+/// <summary>The browser and system a setup request came from (its User-Agent).</summary>
+public sealed record SetupDevice : TouchqueObject
+{
+    /// <summary>E.g. <c>Chrome</c>, <c>Safari</c>.</summary>
+    [JsonConverter(typeof(LenientStringConverter))]
+    public string? Browser { get; init; }
+
+    /// <summary>E.g. <c>macOS</c>, <c>iOS</c>, <c>Windows</c>.</summary>
+    [JsonConverter(typeof(LenientStringConverter))]
+    public string? Os { get; init; }
+
+    /// <summary>E.g. <c>iPhone</c>, when the User-Agent names one.</summary>
+    [JsonConverter(typeof(LenientStringConverter))]
+    public string? Model { get; init; }
 }
 
 /// <summary>A user as Touchque knows them.</summary>
