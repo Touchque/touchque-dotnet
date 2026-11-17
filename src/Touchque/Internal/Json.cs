@@ -81,6 +81,67 @@ internal static class Json
         }
     }
 
+    /// <summary>
+    /// JSON text with every unpaired surrogate escape in its strings (<c>\ud800</c>, as JSON.stringify writes a lone
+    /// surrogate) replaced by <c>\ufffd</c>, so each string reads (System.Text.Json throws on a lone surrogate) and
+    /// encodes as UTF-8. A high surrogate escape right before a low one is a pair and stays; everything else is kept
+    /// as it is, and text without any comes back as the same instance. (A lone surrogate written raw is not text a
+    /// UTF-8 body can carry: the parser refuses it.)
+    /// </summary>
+    public static string WithoutLoneSurrogates(string json)
+    {
+        StringBuilder? sb = null;
+        var inString = false;
+        for (var i = 0; i < json.Length; i++)
+        {
+            var c = json[i];
+            if (!inString || c != '\\' || i + 1 >= json.Length)
+            {
+                if (c == '"') inString = !inString;
+                sb?.Append(c);
+                continue;
+            }
+            if (json[i + 1] == 'u' && Hex4(json, i + 2) is { } unit && char.IsSurrogate(unit))
+            {
+                if (char.IsHighSurrogate(unit) && i + 11 < json.Length && json[i + 6] == '\\' && json[i + 7] == 'u' && Hex4(json, i + 8) is { } low && char.IsLowSurrogate(low))
+                {
+                    sb?.Append(json, i, 12);
+                    i += 11;
+                    continue;
+                }
+                sb ??= new StringBuilder(json.Length).Append(json, 0, i);
+                sb.Append("\\ufffd");
+                i += 5;
+                continue;
+            }
+            // Any other escape (\" \\ \n, \u0041…): its two characters as they are; a \u escape's hex digits follow as text.
+            sb?.Append(c).Append(json[i + 1]);
+            i++;
+        }
+        return sb?.ToString() ?? json;
+    }
+
+    private static char? Hex4(string s, int at)
+    {
+        if (at + 4 > s.Length) return null;
+        var value = 0;
+        for (var k = at; k < at + 4; k++)
+        {
+            var digit = HexDigit(s[k]);
+            if (digit < 0) return null;
+            value = (value << 4) | digit;
+        }
+        return (char)value;
+    }
+
+    private static int HexDigit(char c) => c switch
+    {
+        >= '0' and <= '9' => c - '0',
+        >= 'a' and <= 'f' => c - 'a' + 10,
+        >= 'A' and <= 'F' => c - 'A' + 10,
+        _ => -1,
+    };
+
     /// <summary>A string field, or null when missing or not a string.</summary>
     public static string? Str(JsonNode? node, string key)
     {

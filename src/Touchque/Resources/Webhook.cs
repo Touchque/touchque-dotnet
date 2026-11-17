@@ -179,30 +179,28 @@ public sealed class WebhookResource
         return payload;
     }
 
-    /// <summary>Verifies the signature and the freshness of a webhook (no replay cache) and returns its payload.</summary>
+    /// <summary>
+    /// Verifies the signature and the freshness of a webhook (no replay cache) and returns its payload. The signature
+    /// is checked over the body as received; in the payload every unpaired surrogate (JSON.stringify writes one as a
+    /// <c>\ud800</c> escape, e.g. in a password a user store is asked about) is U+FFFD, so each string reads and
+    /// encodes as UTF-8.
+    /// </summary>
     public JsonObject Verify(string rawBody, string? signature = null, int toleranceSeconds = DefaultToleranceSeconds)
     {
         JsonObject payload;
         try
         {
-            payload = JsonNode.Parse(rawBody) as JsonObject ?? throw new TouchqueWebhookSignatureException("invalid JSON payload");
+            payload = JsonNode.Parse(Json.WithoutLoneSurrogates(rawBody)) as JsonObject ?? throw new TouchqueWebhookSignatureException("invalid JSON payload");
         }
-        catch (JsonException)
+        catch (Exception e) when (e is JsonException or ArgumentException)
         {
+            // ArgumentException: a lone surrogate written raw, which no UTF-8 body carries.
             throw new TouchqueWebhookSignatureException("invalid JSON payload");
         }
         // A member name twice (or one with a lone surrogate) makes System.Text.Json throw on the first read
         // of that object; Touchque never sends one. Values may hold a lone surrogate, as JSON.stringify writes it.
         if (!Json.IsIJson(rawBody, checkValues: false)) throw new TouchqueWebhookSignatureException("invalid JSON payload");
-        string? provided;
-        try
-        {
-            provided = string.IsNullOrEmpty(signature) ? Json.Str(payload, "signature") : signature;
-        }
-        catch (InvalidOperationException)
-        {
-            throw new TouchqueWebhookSignatureException("invalid signature"); // a lone surrogate in the body's signature
-        }
+        var provided = string.IsNullOrEmpty(signature) ? Json.Str(payload, "signature") : signature;
         if (string.IsNullOrEmpty(provided)) throw new TouchqueWebhookSignatureException("no signature provided");
 
         string canonical;

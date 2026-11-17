@@ -476,6 +476,58 @@ public class AspNetCoreTests : IAsyncLifetime
         Assert.Equal(new[] { "APPROVAL_REVOKED" }, events);
     }
 
+    /// <summary>The README's user store endpoint, run against requests signed as Touchque signs them: the customer, or null.</summary>
+    [Fact]
+    public async Task UserStoreEndpointAnswersWithTheCustomer()
+    {
+        var customers = new Customers();
+        await using var app = await AppAsync(a => ReadmeExamples.UserStoreEndpoint(a, customers));
+        var client = app.GetTestClient();
+        async Task<(HttpStatusCode Status, JsonNode? Body)> AskAsync((string Body, string Signature) request, string? signature = null)
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, "/touchque/user-store") { Content = new StringContent(request.Body, Encoding.UTF8, "application/json") };
+            req.Headers.Add("x-signature", signature ?? request.Signature);
+            using var res = await client.SendAsync(req);
+            return (res.StatusCode, JsonNode.Parse(await res.Content.ReadAsStringAsync()));
+        }
+        var ada = JsonNode.Parse("""{"user":{"id":"cus_1","email":"ada@acme.com","emailVerified":true,"name":"Ada"}}""");
+        var none = JsonNode.Parse("""{"user":null}""");
+        var email = ("email", "\"ada@acme.com\"");
+
+        var right = await AskAsync(UserStoreRequest.Build("test_secret", "user_store.verify_password", email, ("password", UserStoreRequest.Password)));
+        Assert.Equal(HttpStatusCode.OK, right.Status);
+        JsonAssert.Equal(ada, right.Body);
+        JsonAssert.Equal(none, (await AskAsync(UserStoreRequest.Build("test_secret", "user_store.verify_password", email, ("password", "\"wrong\"")))).Body);
+        JsonAssert.Equal(ada, (await AskAsync(UserStoreRequest.Build("test_secret", "user_store.get_user", email))).Body);
+        JsonAssert.Equal(none, (await AskAsync(UserStoreRequest.Build("test_secret", "user_store.get_user", ("email", "\"bo@acme.com\"")))).Body);
+        JsonAssert.Equal(none, (await AskAsync(UserStoreRequest.Build("test_secret", "user_store.ping"))).Body);
+        // An unpaired surrogate in the password, as JSON.stringify writes one (a real pair stays raw): the endpoint
+        // reads U+FFFD there, a wrong password for this customer, never a 500.
+        var odd = await AskAsync(UserStoreRequest.Build("test_secret", "user_store.verify_password", email, ("password", "\"pa\\ud800ss \U0001F600\"")));
+        Assert.Equal(HttpStatusCode.OK, odd.Status);
+        JsonAssert.Equal(none, odd.Body);
+        Assert.Equal("pa\uFFFDss \U0001F600", customers.Passwords[^1]);
+        // Not signed with the API secret: 401, which Touchque counts as the user store being unavailable (never as a wrong password).
+        Assert.Equal(HttpStatusCode.Unauthorized, (await AskAsync(UserStoreRequest.Build("another_secret", "user_store.verify_password", email, ("password", UserStoreRequest.Password)))).Status);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await AskAsync(UserStoreRequest.Build("test_secret", "user_store.get_user", email), new string('0', 64))).Status);
+    }
+
+    private sealed class Customers : ReadmeExamples.ICustomers
+    {
+        private static readonly ReadmeExamples.Customer Ada = new("cus_1", true, "Ada");
+
+        /// <summary>The passwords asked about, as the endpoint read them.</summary>
+        public List<string?> Passwords { get; } = new();
+
+        public Task<ReadmeExamples.Customer?> CheckPasswordAsync(string email, string? password)
+        {
+            Passwords.Add(password);
+            return Task.FromResult<ReadmeExamples.Customer?>(email == "ada@acme.com" && password == "pa\"ss wärd" ? Ada : null);
+        }
+
+        public Task<ReadmeExamples.Customer?> FindAsync(string email) => Task.FromResult<ReadmeExamples.Customer?>(email == "ada@acme.com" ? Ada : null);
+    }
+
     [Fact]
     public async Task HostedLoginEndpointsSignInWithACookie()
     {

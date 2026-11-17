@@ -13,7 +13,7 @@ namespace Touchque.Internal;
 /// </summary>
 internal sealed class TouchqueHttp
 {
-    internal const string SdkVersion = "5.4.0";
+    internal const string SdkVersion = "5.5.0";
     private const int MaxResponseBytes = 10 * 1024 * 1024;
 
     private readonly HttpClient _client;

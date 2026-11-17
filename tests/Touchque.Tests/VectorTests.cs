@@ -39,6 +39,58 @@ public class VectorTests
         }
     }
 
+    /// <summary>
+    /// Touchque Login's requests to a user store exactly as the backend sends them (fixtures/user-store-vectors.json):
+    /// the canonical form comes from the text as received (an unpaired surrogate stays the \udxxx escape
+    /// JSON.stringify wrote; U+2028, U+2029, &lt;&gt;&amp;, DEL and non-ASCII raw; NUL and control characters escaped),
+    /// so each verifies with the x-signature header or the body's signature, and the payload comes back with every
+    /// unpaired surrogate as U+FFFD: each string reads and encodes as UTF-8 (a password can be checked). A body changed
+    /// after signing, or another secret, fails.
+    /// </summary>
+    [Fact]
+    public async Task UserStoreVectors()
+    {
+        var vectors = (JsonArray)Paths.Fixture("user-store-vectors.json")["vectors"]!;
+        Assert.Contains(vectors, v => (bool)v!["valid"]!);
+        Assert.Contains(vectors, v => !(bool)v!["valid"]!);
+        var utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+        foreach (var v in vectors)
+        {
+            var name = (string)v!["name"]!;
+            var (body, signature, canonical) = ((string)v["body"]!, (string)v["x_signature"]!, (string)v["canonical"]!);
+            var secret = (string)v["secret"]!;
+            Assert.True(canonical == WebhookResource.Canonicalize(body), name + ": canonical form");
+            using (var hmac = new System.Security.Cryptography.HMACSHA256(Encoding.UTF8.GetBytes(secret)))
+            {
+                var signed = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant() == signature;
+                Assert.True(signed == (bool)v["valid"]!, name + ": the fixture's canonical form signs exactly when valid");
+            }
+            var webhook = new TouchqueClient(new TouchqueOptions { ApiKey = "tq_x", ApiSecret = secret }).Webhook;
+            if (!(bool)v["valid"]!)
+            {
+                // The timestamps are fixed in the past: no freshness check (tolerance 0).
+                Assert.Equal("Touchque: webhook rejected: invalid signature", Assert.Throws<TouchqueWebhookSignatureException>(() => webhook.Verify(body, signature, 0)).Message);
+                Assert.Throws<TouchqueWebhookSignatureException>(() => webhook.Verify(body, null, 0));
+                await Assert.ThrowsAsync<TouchqueWebhookSignatureException>(() => webhook.VerifyAsync(body, signature, 0, new MemoryReplayCache()));
+                continue;
+            }
+            var expected = v["expected_payload"]!.AsObject();
+            var cache = new MemoryReplayCache();
+            foreach (var payload in new[] { webhook.Verify(body, signature, 0), webhook.Verify(body, null, 0), await webhook.VerifyAsync(body, signature, 0, cache) })
+            {
+                Assert.True(expected.Select(p => p.Key).SequenceEqual(payload.Select(p => p.Key)), name + ": members");
+                foreach (var (key, value) in expected)
+                {
+                    var read = (string?)payload[key];
+                    Assert.True((string?)value == read, $"{name}: {key} reads {read}");
+                    Assert.Equal(Encoding.UTF8.GetBytes((string)value!), utf8.GetBytes(read!));
+                }
+                JsonAssert.Equal(expected, JsonNode.Parse(payload.ToJsonString()), name);
+            }
+            await Assert.ThrowsAsync<TouchqueWebhookReplayException>(() => webhook.VerifyAsync(body, signature, 0, cache));
+        }
+    }
+
     [Fact]
     public async Task WebhookSignatureTimestampAndReplay()
     {

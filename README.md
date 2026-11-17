@@ -491,8 +491,103 @@ builder.Services.AddAuthentication().AddTouchqueBearer(o =>
 `HostedLogin` is the OpenID Connect client underneath (PKCE, ID token checks, refresh, token
 exchange, CIBA, the token vault, client credentials, logout); `login.MyAccount(accessToken)` is
 the customer's own account API (profile, sign-in methods, sessions, apps, data export, deletion).
-The Management API is `tq.Identity` (users, roles, organizations, apps, connections, imports and
-exports, attack protection, email and SMS providers).
+The Management API is `tq.Identity` (users, roles, organizations, apps, connections, custom domains,
+imports and exports, attack protection, email and SMS providers, the passkey domain, the user store). Its
+refusals are `TouchqueApiException` with the API's code in `Error` and the field in `Body["field"]`.
+
+### Custom domains
+
+```csharp
+var domain = await tq.Identity.CustomDomains.CreateAsync(new { domain = "login.acme.com" });   // records: what to add in DNS
+domain = await tq.Identity.CustomDomains.VerifyAsync((string)domain["id"]!);                   // checks its DNS now
+var overview = await tq.Identity.CustomDomains.OverviewAsync();                                 // Domains, VerifiedDomains, SlugPasskeys
+```
+
+A domain on one your organization verified (Organization → Domains: `login.acme.com` on `acme.com`)
+is verified when it is added and needs only its CNAME; another needs the TXT record of `records` too.
+Touchque checks a new domain by itself every 5 minutes for 72 hours (`autoCheckUntil`), `VerifyAsync`
+checks it now, and `dns` is what its DNS said at the last check. `ListAsync()` answers the domains;
+`OverviewAsync()` (alias: `tq.Identity.GetCustomDomainsAsync()`) also your organization's
+`VerifiedDomains` (null when they could not be read) and `SlugPasskeys`. The API has no read by id:
+`GetAsync(id)` finds the domain in the list, and throws `TouchqueApiException` 404 `not_found` when it
+is not there.
+
+### Passkey domain
+
+A passkey belongs for good to the domain it was made for, its relying party ID: by default the host
+it was made on, so one made on `acme.login.touchque.com` or `login.acme.com` works only there. With
+a passkey domain, passkeys made on it or on a host under it belong to it, and keep working when
+sign-in moves to another host under it.
+
+```csharp
+await tq.Identity.SetPasskeyDomainAsync("acme.com");   // null: each host its own again
+```
+
+Only a proved domain is taken: one of your verified custom domains, or a domain above one of them
+that your organization verified (Organization → Domains: `acme.com` for `login.acme.com`). Set it
+before customers make passkeys: a change that would leave theirs behind is refused with 409
+`passkeys_exist` (their number in `Body["count"]`). Other refusals: 409 `not_your_domain`, 409
+`organization_unavailable` (your organization's domains could not be read: try again) and 400
+`invalid_request` (field `passkeyDomain`) for a value that is not a domain; before Touchque Login is
+set up for the workspace, 400 `invalid_request` with field `slug`. The answer is the tenant, with
+`passkeyDomain`. `SlugPasskeys` of `CustomDomains.OverviewAsync()` counts customer passkeys made on
+`{slug}.login.touchque.com`, which stay with that name and do not work on a custom domain. This is
+for customers' passkeys on the hosted pages; `tq.WebAuthn` passkeys use the passkey domain set in
+the dashboard (Developers → App user policy).
+
+### Moving customers in from your own user database
+
+Customers keep the password they have with you. While one has no account here yet, Touchque asks
+your endpoint; once it confirms the password, the account is made here with it (Argon2id) and your
+database is not asked about that customer again.
+
+```csharp
+await tq.Identity.SetUserStoreAsync("https://api.acme.com/touchque/user-store", enabled: true);
+var ping = await tq.Identity.TestUserStoreAsync();     // { ok, error, ms }: a failed ping is an answer, not an exception
+var store = await tq.Identity.GetUserStoreAsync();     // url, enabled, active, movedIn, lastCall, paused, updatedAt
+await tq.Identity.RemoveUserStoreAsync();              // stops asking; accounts already moved in stay
+```
+
+`SetUserStoreAsync` sends only the arguments that are not null (the endpoint set stays; `enabled`
+stays as it is, on for a new one). The endpoint must be a public https address. It is asked only
+while it is enabled and passwords are on (`active`): turning it on with passwords off is refused
+with 409 `passwords_off`, and turning passwords off (`signInMethods.password: false`) while it is on
+with 409 `user_store_on`. `TestUserStoreAsync(url)` pings another address before you set it (null or
+`""`: the endpoint set). `RemoveUserStoreAsync` succeeds when none is set too; 404 `not_enabled`
+means Touchque Login is not set up.
+
+Touchque signs its requests to your endpoint like its webhooks, so `MapTouchqueWebhook` checks the
+signature, the timestamp and the `jti` (elsewhere: `tq.Webhook.VerifyAsync(rawBody, signatureHeader)`).
+The signature is checked over the body as received; in the payload an unpaired surrogate (which
+JSON.stringify writes as `\ud800`) is U+FFFD, so a password reads and encodes as UTF-8:
+
+```csharp
+app.MapTouchqueWebhook("/touchque/user-store", async (JsonObject e, HttpContext http) =>
+{
+    var email = (string?)e["email"];
+    var customer = (string?)e["event"] switch
+    {
+        "user_store.verify_password" => await customers.CheckPasswordAsync(email!, (string?)e["password"]),   // null: unknown or wrong
+        "user_store.get_user" => await customers.FindAsync(email!),
+        _ => null,                                                                                         // user_store.ping
+    };
+    return Results.Json(new { user = customer is null ? null : new { id = customer.Id, email, emailVerified = customer.EmailVerified, name = customer.Name } });
+});
+```
+
+- `user_store.verify_password` { email, password }: a password sign-in of an address with no account here yet.
+- `user_store.get_user` { email }: a password reset, an email code or a sign-up with such an address
+  (the account is made without a password; the reset or the code proves the inbox).
+- `user_store.ping`: `TestUserStoreAsync`.
+
+Each also carries `tenant`, `timestamp` and `jti`. Answer 200 `{ "user": { … } }` or
+`{ "user": null }` within 5 seconds, the same for an unknown address and a wrong password (404
+counts as null). `id` (your id for the customer, kept as its `externalId`) and `email` (the address
+asked about) are required; `emailVerified`, `name`, `givenName`, `familyName`, `nickname`, `picture`
+(https), `locale`, `phone`, `userMetadata` and `appMetadata` are taken too. Another status, a
+redirect, a body that is not JSON, a user without `id` or with another `email`, or no answer in 5
+seconds counts as unavailable: a password sign-in is then not refused as a wrong password, and 5 in
+a row pause asking for a minute (`paused`).
 
 ## Mobile SDK (your own app approves)
 

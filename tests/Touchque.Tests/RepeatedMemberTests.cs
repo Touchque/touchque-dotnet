@@ -128,7 +128,8 @@ public class RepeatedMemberTests
     /// <summary>
     /// A webhook body that repeats a member name (Touchque never sends one) is the webhook's usual signature
     /// error, not an ArgumentException from the first read of the payload; a lone surrogate in a value is
-    /// what JSON.stringify writes for one, and a signed delivery with it still verifies.
+    /// what JSON.stringify writes for one, and a signed delivery with it still verifies, its payload reading
+    /// U+FFFD there.
     /// </summary>
     [Fact]
     public async Task WebhooksAnswerTheirSignatureError()
@@ -163,8 +164,36 @@ public class RepeatedMemberTests
         // A lone surrogate in the body's signature: not a signature (it threw InvalidOperationException on its read).
         Assert.Equal("Touchque: webhook rejected: invalid signature", Assert.Throws<TouchqueWebhookSignatureException>(() => webhook.Verify("{\"signature\":\"\\ud800\"}")).Message);
 
-        // A lone surrogate in another value, as JSON.stringify escapes it: verified as before.
+        // A lone surrogate in another value, as JSON.stringify escapes it: verified as before, and it reads U+FFFD.
         var odd = "{\"event\":\"DEVICE_LINKED\",\"externalUsername\":\"ada\\ud83d\",\"timestamp\":\"" + now + "\",\"jti\":\"j2\"}";
-        Assert.Equal("j2", (string?)(await webhook.VerifyAsync(odd, Sign(odd), 300, new MemoryReplayCache()))["jti"]);
+        var payload = await webhook.VerifyAsync(odd, Sign(odd), 300, new MemoryReplayCache());
+        Assert.Equal(("j2", "ada\uFFFD"), ((string?)payload["jti"], (string?)payload["externalUsername"]));
+        Assert.Equal("ada\uFFFD", (string?)JsonNode.Parse(payload.ToJsonString())!["externalUsername"]);   // it writes, too
+        // The signature covers the text as received: the same body with U+FFFD in place of the escape is another body.
+        Assert.Equal("Touchque: webhook rejected: invalid signature", Assert.Throws<TouchqueWebhookSignatureException>(() => webhook.Verify(odd.Replace("\\ud83d", "\uFFFD"), Sign(odd))).Message);
+        // A lone surrogate written raw is not text a UTF-8 body carries: invalid, not an ArgumentException.
+        var raw = odd.Replace("\\ud83d", "\ud83d");
+        Assert.Equal("Touchque: webhook rejected: invalid JSON payload", Assert.Throws<TouchqueWebhookSignatureException>(() => webhook.Verify(raw, Sign(odd))).Message);
     }
+
+    /// <summary>
+    /// The payload text a verified webhook is read from: each unpaired surrogate escape becomes \ufffd (in names
+    /// too; a webhook with one there is refused before), a pair of escapes stays, and so does everything else.
+    /// </summary>
+    [Theory]
+    [InlineData("""{"a":"\ud800"}""", """{"a":"\ufffd"}""")]
+    [InlineData("""{"a":"\uDBFF","b":"\udc00x\uDFFF"}""", """{"a":"\ufffd","b":"\ufffdx\ufffd"}""")]
+    [InlineData("""{"a":"x\ude00\ud83dy\ud83d\ude00z"}""", """{"a":"x\ufffd\ufffdy\ud83d\ude00z"}""")]
+    [InlineData("""{"a":"\ud83d\ud83d\ude00"}""", """{"a":"\ufffd\ud83d\ude00"}""")]
+    [InlineData("""{"a":"\ud83d\\ude00"}""", """{"a":"\ufffd\\ude00"}""")]
+    [InlineData("""{"a":"\ud83d\u0041\ud800\u"}""", """{"a":"\ufffd\u0041\ufffd\u"}""")]
+    [InlineData("""{"\ud800":["\udfff",1,{"b":"\ud800"}]}""", """{"\ufffd":["\ufffd",1,{"b":"\ufffd"}]}""")]
+    [InlineData("""{"a":"\"\\","b":"\ud800"}""", """{"a":"\"\\","b":"\ufffd"}""")]
+    public void LoneSurrogateEscapesBecomeReplacementCharacters(string json, string expected) => Assert.Equal(expected, Json.WithoutLoneSurrogates(json));
+
+    [Theory]
+    [InlineData("""{"a":"\ud83d\ude00","b":"\uD83D\uDE00 \u00e9 \\ud800 \\\\"}""")]
+    [InlineData("""{"a":"😀 é \u2028","b":"\\\"\ud8"}""")]
+    [InlineData("not json \\ud800")]
+    public void TextWithoutLoneSurrogatesComesBackAsItIs(string json) => Assert.Same(json, Json.WithoutLoneSurrogates(json));
 }

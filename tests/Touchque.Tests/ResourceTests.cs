@@ -302,6 +302,35 @@ public class ResourceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task UserStoreCalls()
+    {
+        var tq = _api.Client();
+        await _api.ResetAsync();
+        await tq.Identity.GetUserStoreAsync();
+        await tq.Identity.SetUserStoreAsync("https://api.acme.test/touchque/user-store", true);
+        await tq.Identity.TestUserStoreAsync();
+        await tq.Identity.RemoveUserStoreAsync();
+        var calls = (await _api.CallsAsync()).Where(c => ((string)c!["path"]!).StartsWith("/identity/user-store", StringComparison.Ordinal)).ToList();
+        Assert.Equal(new[] { "GET /identity/user-store", "PUT /identity/user-store", "POST /identity/user-store/test", "DELETE /identity/user-store" },
+            calls.Select(c => (string)c!["method"]! + " " + (string)c["url"]!));
+        JsonAssert.Equal(new { url = "https://api.acme.test/touchque/user-store", enabled = true }, calls[1]!["body"]);
+    }
+
+    [Fact]
+    public async Task PasskeyDomainCalls()
+    {
+        var tq = _api.Client();
+        await _api.ResetAsync();
+        await tq.Identity.SetPasskeyDomainAsync("acme.com");
+        await tq.Identity.SetPasskeyDomainAsync(null);
+        var calls = (await _api.CallsAsync()).Where(c => (string)c!["path"]! == "/identity/tenant").ToList();
+        Assert.Equal(2, calls.Count);
+        Assert.All(calls, c => Assert.Equal("PUT", (string)c!["method"]!));
+        JsonAssert.Equal(new { passkeyDomain = "acme.com" }, calls[0]!["body"]);
+        JsonAssert.Equal(JsonNode.Parse("""{"passkeyDomain":null}"""), calls[1]!["body"]);
+    }
+
+    [Fact]
     public async Task PasskeyBackendCalls()
     {
         var tq = _api.Client();

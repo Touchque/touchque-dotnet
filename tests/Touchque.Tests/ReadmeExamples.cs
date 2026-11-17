@@ -199,6 +199,79 @@ internal static class ReadmeExamples
         public Task<Transfer> SendAsync(Transfer t) => Task.FromResult(t);
     }
 
+    /// <summary>A customer in your own user database ("Moving customers in from your own user database").</summary>
+    public sealed record Customer(string Id, bool EmailVerified, string? Name);
+
+    /// <summary>Your own user database, as the README's user store endpoint uses it.</summary>
+    public interface ICustomers
+    {
+        /// <summary>The customer when the password is right; null for an unknown address or a wrong password.</summary>
+        Task<Customer?> CheckPasswordAsync(string email, string? password);
+
+        Task<Customer?> FindAsync(string email);
+    }
+
+    /// <summary>"Custom domains", "Passkey domain" and "Moving customers in from your own user database": the Management API calls.</summary>
+    public static async Task TouchqueLoginSettingsExamples(TouchqueClient tq)
+    {
+        var domain = await tq.Identity.CustomDomains.CreateAsync(new { domain = "login.acme.com" });   // records: what to add in DNS
+        domain = await tq.Identity.CustomDomains.VerifyAsync((string)domain["id"]!);                   // checks its DNS now
+        var overview = await tq.Identity.CustomDomains.OverviewAsync();                                 // Domains, VerifiedDomains, SlugPasskeys
+
+        // The prose: the list, the alias, and a domain by id (404 not_found when it is not there).
+        JsonArray domains = await tq.Identity.CustomDomains.ListAsync();
+        CustomDomainsOverview same = await tq.Identity.GetCustomDomainsAsync();
+        _ = (overview.Domains, overview.VerifiedDomains, overview.SlugPasskeys, domains, same);
+        try
+        {
+            domain = await tq.Identity.CustomDomains.GetAsync((string)domain["id"]!);
+        }
+        catch (TouchqueApiException e) when (e.Status == 404 && e.Error == "not_found")
+        {
+        }
+
+        await tq.Identity.SetPasskeyDomainAsync("acme.com");   // null: each host its own again
+
+        // The prose: the refusal when customer passkeys would be left behind, and the field of the others.
+        try
+        {
+            await tq.Identity.SetPasskeyDomainAsync(null);
+        }
+        catch (TouchqueApiException e) when (e.Status == 409 && e.Error == "passkeys_exist")
+        {
+            _ = (int?)e.Body["count"];
+        }
+        catch (TouchqueApiException e) when (e.Error == "invalid_request")
+        {
+            _ = (string?)e.Body["field"];   // passkeyDomain, or slug before Touchque Login is set up
+        }
+
+        await tq.Identity.SetUserStoreAsync("https://api.acme.com/touchque/user-store", enabled: true);
+        var ping = await tq.Identity.TestUserStoreAsync();     // { ok, error, ms }: a failed ping is an answer, not an exception
+        var store = await tq.Identity.GetUserStoreAsync();     // url, enabled, active, movedIn, lastCall, paused, updatedAt
+        await tq.Identity.RemoveUserStoreAsync();              // stops asking; accounts already moved in stay
+        _ = (ping, store);
+
+        // The prose: another address pinged before it is set.
+        _ = await tq.Identity.TestUserStoreAsync("https://api.acme.com/touchque/user-store-v2");
+    }
+
+    /// <summary>"Moving customers in from your own user database": your endpoint. AspNetCoreTests runs it too.</summary>
+    public static void UserStoreEndpoint(WebApplication app, ICustomers customers)
+    {
+        app.MapTouchqueWebhook("/touchque/user-store", async (JsonObject e, HttpContext http) =>
+        {
+            var email = (string?)e["email"];
+            var customer = (string?)e["event"] switch
+            {
+                "user_store.verify_password" => await customers.CheckPasswordAsync(email!, (string?)e["password"]),   // null: unknown or wrong
+                "user_store.get_user" => await customers.FindAsync(email!),
+                _ => null,                                                                                         // user_store.ping
+            };
+            return Results.Json(new { user = customer is null ? null : new { id = customer.Id, email, emailVerified = customer.EmailVerified, name = customer.Name } });
+        });
+    }
+
     /// <summary>"Linking the phone (first-time QR)".</summary>
     public static async Task SetupContextExample(TouchqueClient tq, HttpContext http, string userId, string secret)
     {

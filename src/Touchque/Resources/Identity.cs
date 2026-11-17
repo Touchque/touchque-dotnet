@@ -31,7 +31,7 @@ public sealed class IdentityResource
         Clients = new IdentityClients(http);
         Apis = new IdentityCrud(http, "/identity/apis", "apis");
         Connections = new IdentityCrud(http, "/identity/connections", "connections");
-        CustomDomains = new IdentityCrud(http, "/identity/custom-domains", "domains");
+        CustomDomains = new IdentityCustomDomains(http);
     }
 
     public IdentityUsers Users { get; }
@@ -42,7 +42,9 @@ public sealed class IdentityResource
     public IdentityClients Clients { get; }
     public IdentityCrud Apis { get; }
     public IdentityCrud Connections { get; }
-    public IdentityCrud CustomDomains { get; }
+
+    /// <summary>Your own sign-in domains (<c>login.acme.com</c>): list, overview, get, create, verify, update (primary), delete.</summary>
+    public IdentityCustomDomains CustomDomains { get; }
 
     /// <summary>The tenant (404 not_enabled until it is set up).</summary>
     public Task<JsonObject> GetTenantAsync(CancellationToken ct = default) => _http.GetAsync<JsonObject>("/identity/tenant", null, ct);
@@ -66,6 +68,27 @@ public sealed class IdentityResource
     /// </summary>
     public Task<JsonObject> SetCustomDomainOnlyAsync(bool on, CancellationToken ct = default) =>
         _http.PutAsync<JsonObject>("/identity/tenant", new JsonObject { ["customDomainOnly"] = on }, ct);
+
+    /// <summary>
+    /// The domain customer passkeys are made for (their relying party ID): null or "" for none (a passkey belongs to the
+    /// host it was made on), one of your verified custom domains, or a domain above one of them that your organization
+    /// verified (Organization → Domains: <c>acme.com</c> for <c>login.acme.com</c>), so passkeys keep working when
+    /// sign-in moves to another host under it. Answers the tenant (<c>passkeyDomain</c>). Refusals are <see cref="TouchqueApiException"/>
+    /// with the code in <see cref="TouchqueApiException.Error"/> and the field in <c>Body["field"]</c>: 400
+    /// <c>invalid_request</c> (field <c>passkeyDomain</c>) for a value that is not a domain; 409 <c>not_your_domain</c>;
+    /// 409 <c>organization_unavailable</c> (your organization's domains could not be read: try again); 409
+    /// <c>passkeys_exist</c> (<c>Body["count"]</c> customer passkeys would stop working: set it before customers make
+    /// passkeys). Before Touchque Login is set up for the workspace: 400 <c>invalid_request</c> with field <c>slug</c>
+    /// (set it up with <see cref="UpdateTenantAsync"/> first).
+    /// </summary>
+    public Task<JsonObject> SetPasskeyDomainAsync(string? domain, CancellationToken ct = default) =>
+        _http.PutAsync<JsonObject>("/identity/tenant", new JsonObject { ["passkeyDomain"] = domain }, ct);
+
+    /// <summary>
+    /// An alias of <see cref="IdentityCustomDomains.OverviewAsync"/> (<c>CustomDomains.OverviewAsync()</c>): the
+    /// custom-domain list as Touchque answers it, the domains with <c>VerifiedDomains</c> and <c>SlugPasskeys</c>.
+    /// </summary>
+    public Task<CustomDomainsOverview> GetCustomDomainsAsync(CancellationToken ct = default) => CustomDomains.OverviewAsync(ct);
 
     /// <summary>Checks a verified custom domain's certificate at the sign-in edge now (<c>certificate</c>: pending | active | error).</summary>
     public Task<JsonObject> CheckDomainCertificateAsync(string domainId, CancellationToken ct = default) =>
@@ -100,6 +123,48 @@ public sealed class IdentityResource
     /// <summary>One test message through the provider in use.</summary>
     public Task<JsonObject> TestDeliveryAsync(string channel, string to, CancellationToken ct = default) =>
         _http.PostAsync<JsonObject>("/identity/delivery/" + TouchqueHttp.Seg(channel) + "/test", new JsonObject { ["to"] = to }, ct);
+
+    /// <summary>
+    /// Moving your customers in from your own user database: <c>url</c>, <c>enabled</c>, <c>active</c> (asked only
+    /// while it is enabled and passwords are on), <c>movedIn</c> (accounts made from it so far), <c>lastCall</c> ({ at, event, ok, status,
+    /// ms, error } or null), <c>paused</c> (5 failed calls in a row pause it for a minute), <c>updatedAt</c>. Touchque
+    /// POSTs <c>user_store.verify_password</c> { email, password } and <c>user_store.get_user</c> { email } to <c>url</c>,
+    /// signed like its webhooks: check each with <see cref="WebhookResource.VerifyAsync"/> (or <c>MapTouchqueWebhook</c>),
+    /// then answer 200 { "user": { "id", "email", … } } or { "user": null } (the same for an unknown address and a wrong
+    /// password; 404 counts as null) within 5 seconds.
+    /// </summary>
+    public Task<JsonObject> GetUserStoreAsync(CancellationToken ct = default) =>
+        _http.GetAsync<JsonObject>("/identity/user-store", null, ct);
+
+    /// <summary>
+    /// Sets the endpoint and whether it is asked. A null argument is left out: the endpoint set stays, and
+    /// <paramref name="enabled"/> stays as it is (on for a new one). Answers like <see cref="GetUserStoreAsync"/>.
+    /// Refusals (<see cref="TouchqueApiException.Error"/>): 409 <c>passwords_off</c> (turning it on while passwords are off),
+    /// 400 <c>invalid_request</c> with <c>field</c> url (not a full https URL, a user name or password in it, a local address,
+    /// over 500 characters, or none given and none set).
+    /// </summary>
+    public Task<JsonObject> SetUserStoreAsync(string? url = null, bool? enabled = null, CancellationToken ct = default)
+    {
+        var body = new JsonObject();
+        if (url != null) body["url"] = url;
+        if (enabled != null) body["enabled"] = enabled;
+        return _http.PutAsync<JsonObject>("/identity/user-store", body, ct);
+    }
+
+    /// <summary>
+    /// One signed <c>user_store.ping</c> to <paramref name="url"/> (null or "": the endpoint set, sent as <c>{}</c>):
+    /// { ok, error, ms }. An endpoint that fails is an answer (<c>ok</c> false, <c>error</c> says why), not an exception,
+    /// and it never pauses the endpoint.
+    /// </summary>
+    public Task<JsonObject> TestUserStoreAsync(string? url = null, CancellationToken ct = default) =>
+        _http.PostAsync<JsonObject>("/identity/user-store/test", string.IsNullOrEmpty(url) ? new JsonObject() : new JsonObject { ["url"] = url }, ct);
+
+    /// <summary>
+    /// Stops asking your user database and forgets the endpoint; accounts already moved in stay. Answers an empty object
+    /// (204), also when none is set; 404 <c>not_enabled</c> means Touchque Login is not set up.
+    /// </summary>
+    public Task<JsonObject> RemoveUserStoreAsync(CancellationToken ct = default) =>
+        _http.DeleteAsync<JsonObject>("/identity/user-store", ct);
 }
 
 internal static class IdentityQuery
@@ -145,13 +210,72 @@ public class IdentityCrud
         return res?[_listKey]?.DeepClone() as JsonArray ?? new JsonArray();
     }
 
-    public Task<JsonObject> GetAsync(string id, CancellationToken ct = default) => Http.GetAsync<JsonObject>(Base + "/" + TouchqueHttp.Seg(id), null, ct);
+    public virtual Task<JsonObject> GetAsync(string id, CancellationToken ct = default) => Http.GetAsync<JsonObject>(Base + "/" + TouchqueHttp.Seg(id), null, ct);
 
     public Task<JsonObject> CreateAsync(object body, CancellationToken ct = default) => Http.PostAsync<JsonObject>(Base, Json.ToNode(body), ct);
 
     public Task<JsonObject> UpdateAsync(string id, object body, CancellationToken ct = default) => Http.PatchAsync<JsonObject>(Base + "/" + TouchqueHttp.Seg(id), Json.ToNode(body), ct);
 
     public Task<JsonObject> DeleteAsync(string id, CancellationToken ct = default) => Http.DeleteAsync<JsonObject>(Base + "/" + TouchqueHttp.Seg(id), ct);
+}
+
+/// <summary>
+/// Your own sign-in domains (<c>login.acme.com</c>). <see cref="IdentityCrud.ListAsync"/> answers the domains, each
+/// with <c>dns</c> (what its DNS said at the last check) and <c>autoCheckUntil</c>; <see cref="OverviewAsync"/> the
+/// whole answer. The API has no read by id: <see cref="GetAsync"/> finds the domain in the list.
+/// </summary>
+public sealed class IdentityCustomDomains : IdentityCrud
+{
+    internal IdentityCustomDomains(TouchqueHttp http) : base(http, "/identity/custom-domains", "domains") { }
+
+    /// <summary>
+    /// The list as Touchque answers it: the domains (what <see cref="IdentityCrud.ListAsync"/> returns), your
+    /// organization's verified domains and <c>slugPasskeys</c>. <see cref="IdentityResource.GetCustomDomainsAsync"/>
+    /// is an alias.
+    /// </summary>
+    public Task<CustomDomainsOverview> OverviewAsync(CancellationToken ct = default) =>
+        Http.GetAsync<CustomDomainsOverview>(Base, null, ct);
+
+    /// <summary>
+    /// The domain with this id, found in <see cref="IdentityCrud.ListAsync"/>. None: a <see cref="TouchqueApiException"/>
+    /// shaped like the API's 404 (<see cref="TouchqueApiException.Status"/> 404, <see cref="TouchqueApiException.Error"/>
+    /// <c>not_found</c>).
+    /// </summary>
+    public override async Task<JsonObject> GetAsync(string id, CancellationToken ct = default)
+    {
+        foreach (var domain in await ListAsync(null, ct).ConfigureAwait(false))
+        {
+            if (domain is JsonObject found && Json.Str(found, "id") == id) return (JsonObject)found.DeepClone();
+        }
+        throw new TouchqueApiException(404, new JsonObject { ["error"] = "not_found", ["message"] = "No custom domain with this id" });
+    }
+
+    /// <summary>
+    /// Checks the domain's DNS TXT record now (a domain on one your organization verified needs none, only its CNAME)
+    /// and looks at its DNS (<c>dns</c>); answers the domain (<c>status</c> verified once it is). Touchque also checks a
+    /// new domain by itself every 5 minutes until <c>autoCheckUntil</c>, 72 hours after it was added.
+    /// </summary>
+    public Task<JsonObject> VerifyAsync(string id, CancellationToken ct = default) =>
+        Http.PostAsync<JsonObject>(Base + "/" + TouchqueHttp.Seg(id) + "/verify", new JsonObject(), ct);
+}
+
+/// <summary>Your custom domains as <c>GET /identity/custom-domains</c> answers them (<see cref="IdentityCustomDomains.OverviewAsync"/>).</summary>
+public sealed record CustomDomainsOverview : TouchqueObject
+{
+    /// <summary>
+    /// The domains, what <see cref="IdentityCrud.ListAsync"/> returns: each the API's JSON (<c>id</c>, <c>domain</c>,
+    /// <c>status</c>, <c>primary</c>, <c>proof</c>, <c>records</c>, <c>certificate</c>, <c>dns</c>, <c>autoCheckUntil</c>…).
+    /// </summary>
+    public JsonArray Domains { get; init; } = new();
+
+    /// <summary>
+    /// Your organization's verified domains (Organization → Domains): a passkey domain above a custom domain must be one
+    /// of them. Null when they could not be read.
+    /// </summary>
+    public IReadOnlyList<string>? VerifiedDomains { get; init; }
+
+    /// <summary>Customer passkeys made on <c>{slug}.login.touchque.com</c>: they belong to that name and do not work on a custom domain.</summary>
+    public int SlugPasskeys { get; init; }
 }
 
 /// <summary>Business customers, their members and invitations.</summary>
